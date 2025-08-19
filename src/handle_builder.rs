@@ -7,7 +7,6 @@
 //! Builder for creating a [`NoSQL Handle`](crate::Handle)
 //!
 
-
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use std::default::Default;
 use std::env;
@@ -51,6 +50,7 @@ pub struct HandleBuilder {
     pub(crate) in_test: bool,
     // For error messaging
     pub(crate) from_environment: bool,
+    pub(crate) default_compartment_id: String,
 }
 
 #[derive(Default, Debug)]
@@ -151,6 +151,7 @@ impl HandleBuilder {
     /// | `ORACLE_NOSQL_REGION` | The OCI region identifier. See [`HandleBuilder::cloud_region()`]. |
     /// | `ORACLE_NOSQL_AUTH` | The auth mechanism. One of: `user`, `instance`, `resource`, `onprem`, `cloudsim`. |
     /// | `ORACLE_NOSQL_AUTH_FILE` | For `user` auth, the path to the OCI config file (see [`HandleBuilder::cloud_auth_from_file()`]). For `onprem` auth, the path to the onprem user/password file (see [`HandleBuilder::onprem_auth_from_file()`]).
+    /// | `ORACLE_NOSQL_COMPARTMENT_ID` | For OCI auth, the default compartment id to use (see [`HandleBuilder::compartment_id()`]).
     /// | `ORACLE_NOSQL_CA_CERT` | For `onprem` auth, the path to the certificate file in `pem` format (see [`HandleBuilder::add_cert_from_pemfile()`]). |
     /// | `ORACLE_NOSQL_ACCEPT_INVALID_CERTS` | For `onprem` auth, if this is set to `1` or `true`, do not check certificates (see [`HandleBuilder::danger_accept_invalid_certs()`]). |
     ///
@@ -167,6 +168,9 @@ impl HandleBuilder {
         }
         if let Some(val) = env::var("ORACLE_NOSQL_REGION").ok() {
             self = self.cloud_region(&val)?;
+        }
+        if let Some(val) = env::var("ORACLE_NOSQL_COMPARTMENT_ID").ok() {
+            self = self.compartment_id(&val)?;
         }
         if let Some(val) = env::var("ORACLE_NOSQL_CA_CERT").ok() {
             self = self.add_cert_from_pemfile(&val)?;
@@ -364,6 +368,18 @@ impl HandleBuilder {
         self.region = Some(r);
         self.use_https = true;
         self.mode = HandleMode::Cloud;
+        Ok(self)
+    }
+    /// Cloud Service only: set the name or id of a compartment to be used for all operations.
+    ///
+    /// If the associated handle authenticated as an Instance Principal, this value must be an OCID.
+    /// In all other cases, the value may be specified as either a name (or path for nested compartments) or as an OCID.
+    ///
+    /// This value may be overridden on a per-request basis.
+    ///
+    /// If no compartment is given, the root compartment of the tenancy will be used.
+    pub fn compartment_id(mut self, compartment_id: &str) -> Result<Self, NoSQLError> {
+        self.default_compartment_id = compartment_id.to_string();
         Ok(self)
     }
     /// Specify credentials for use with a secure On-premises NoSQL Server.

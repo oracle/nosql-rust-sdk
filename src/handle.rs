@@ -218,10 +218,17 @@ impl Handle {
         }
 
         if let Some(sp) = oci_provider {
-            headers.insert(
-                "x-nosql-compartment-id",
-                HeaderValue::from_str(sp.tenancy_id())?,
-            );
+            if !self.inner.builder.default_compartment_id.is_empty() {
+                headers.insert(
+                    "x-nosql-compartment-id",
+                    HeaderValue::from_str(&self.inner.builder.default_compartment_id)?,
+                );
+            } else {
+                headers.insert(
+                    "x-nosql-compartment-id",
+                    HeaderValue::from_str(sp.tenancy_id())?,
+                );
+            }
             {
                 // If there's a session cookie value, set it into the headers.
                 // The lock is needed because another async operation might try to
