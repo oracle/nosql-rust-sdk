@@ -1,6 +1,6 @@
 [package]
 name = "oracle-nosql-rust-sdk"
-version = "0.1.1"
+version = "0.1.2"
 rust-version = "1.78"
 license = "UPL-1.0"
 description = "Oracle Rust SDK for the NoSQL Database"

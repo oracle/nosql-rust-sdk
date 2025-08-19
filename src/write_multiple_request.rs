@@ -154,12 +154,11 @@ impl WriteMultipleRequest {
 
     /// Cloud Service only: set the name or id of a compartment to be used for this operation.
     ///
-    /// The compartment may be specified as either a name (or path for nested compartments) or as an id (OCID).
-    /// A name (vs id) can only be used when authenticated using a specific user identity. It is not available if
-    /// the associated handle authenticated as an Instance Principal (which can be done when calling the service from
-    /// a compute instance in the Oracle Cloud Infrastructure: see [`HandleBuilder::cloud_auth_from_instance()`](crate::HandleBuilder::cloud_auth_from_instance()).)
+    /// If the associated handle authenticated as an Instance Principal, this value must be an OCID.
+    /// In all other cases, the value may be specified as either a name (or path for nested compartments) or as an OCID.
     ///
-    /// If no compartment is given, the root compartment of the tenancy will be used.
+    /// If no compartment is given, the default compartment id for the handle is used. If that value was
+    /// not specified, the root compartment of the tenancy will be used.
     pub fn compartment_id(mut self, compartment_id: &str) -> Self {
         self.compartment_id = compartment_id.to_string();
         self
