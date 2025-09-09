@@ -63,7 +63,7 @@
 //! To do so, add the following dependency to your `Cargo.toml` file:
 //! ```text
 //! [dependencies]
-//! oracle-nosql-rust-sdk = "0.1.0"
+//! oracle-nosql-rust-sdk = "0.1"
 //! ```
 //!
 //! ## Configuring the SDK
@@ -460,7 +460,7 @@
 //!
 //! ## License
 //!
-//! Copyright (C) 2019, 2024, 2025 Oracle and/or its affiliates. All rights reserved.
+//! Copyright (C) 2024, 2025 Oracle and/or its affiliates. All rights reserved.
 //!
 //! This SDK is licensed under the Universal Permissive License 1.0. See
 //! [LICENSE](https://github.com/oracle/nosql-rust-sdk/blob/main/LICENSE.txt) for
