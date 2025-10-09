@@ -5,6 +5,7 @@
 //  https://oss.oracle.com/licenses/upl/
 //
 use crate::qtf::{TestCase, TestRunner, TestSuite};
+use crate::rate_limiter::RateLimiter;
 use crate::sort_iter::SortSpec;
 use crate::types::*;
 use crate::Handle;
@@ -32,14 +33,23 @@ async fn get_handle() -> Result<Handle, NoSQLError> {
     Handle::builder()
         .endpoint("http://localhost:8080")?
         .mode(HandleMode::Cloudsim)?
-        .timeout(Duration::new(5, 0))?
+        .timeout(Duration::new(30, 0))?
         //.cloud_auth_from_file("~/.oci/config")?
+        .from_environment()?
         .build()
         .await
 }
 
 #[tokio::test]
 async fn qtf_test() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+        .without_time()
+        .with_ansi(false)
+        .with_level(false)
+        .compact()
+        .init();
+
     let handle = get_handle().await?;
 
     let qtf_root_dir = std::env::var("QTF_ROOT_DIR").unwrap_or("".to_string());
@@ -49,6 +59,9 @@ async fn qtf_test() -> Result<(), Box<dyn Error>> {
 
     let runner = TestRunner::new(&qtf_root_dir)?;
     let mut totals = SuiteResults::default();
+
+    // TODO: cmdline arg? environment?
+    let mut rl = RateLimiter::new(3.0);
 
     for name in &runner.dir_names {
         if runner.is_excluded_test_suite(name) {
@@ -80,7 +93,7 @@ async fn qtf_test() -> Result<(), Box<dyn Error>> {
             ts.excluded_test_cases = m.clone();
         }
 
-        match run_test_suite(&mut ts, &handle).await {
+        match run_test_suite(&mut ts, &handle, &mut rl).await {
             Ok(r) => {
                 println!("Suite {}: {:?}", name, r);
                 totals.passed += r.passed;
@@ -90,6 +103,7 @@ async fn qtf_test() -> Result<(), Box<dyn Error>> {
             Err(e) => {
                 println!("FAIL: Test suite {name} failed: {}", e);
                 totals.failed += runner.get_num_tests(name);
+                tear_down_test_suite(&mut ts, &handle, &mut rl).await?;
             }
         }
     }
@@ -105,6 +119,7 @@ async fn qtf_test() -> Result<(), Box<dyn Error>> {
 async fn run_test_suite(
     ts: &mut TestSuite,
     handle: &Handle,
+    rl: &mut RateLimiter,
 ) -> Result<SuiteResults, Box<dyn Error>> {
     let mut tr = SuiteResults::default();
     let tc_names = ts.get_test_case_names()?;
@@ -137,32 +152,38 @@ async fn run_test_suite(
         // The "delete" test suite requires setting up test assets for each test case
         // otherwise the test result may be affected by the previous tests.
         if ts.name == "delete" || ts.is_set_up == false {
-            set_up_test_suite(ts, handle).await?;
+            set_up_test_suite(ts, handle, rl).await?;
             ts.is_set_up = true;
         }
 
         run_test_case(ts, &mut tc, &mut tr, handle).await;
     }
 
-    tear_down_test_suite(ts, handle).await?;
+    tear_down_test_suite(ts, handle, rl).await?;
     Ok(tr)
 }
 
 #[async_recursion(?Send)]
-async fn set_up_test_suite(ts: &TestSuite, handle: &Handle) -> Result<(), Box<dyn Error>> {
+async fn set_up_test_suite(
+    ts: &TestSuite,
+    handle: &Handle,
+    rl: &mut RateLimiter,
+) -> Result<(), Box<dyn Error>> {
     // Do cleanup in case the previous run did not drop tables/indexes.
-    clean_up(ts, handle).await?;
+    clean_up(ts, handle, rl).await?;
 
     for dep in &ts.dependencies {
-        set_up_test_suite(dep, handle).await?;
+        set_up_test_suite(dep, handle, rl).await?;
     }
 
     // Set a table limit that are required for cloud tests.
-    let limits = TableLimits::provisioned(15000, 15000, 50);
+    let limits = TableLimits::provisioned(5000, 5000, 3);
 
     if ts.before_ddls.len() > 0 {
         println!("Executing suite {} DDLs on setup:", ts.name);
     }
+
+    // TODO: if total units for table creation exceeds max, set limit for each to 1/Nth
 
     for stmt in &ts.before_ddls {
         println!("  {}", stmt);
@@ -180,26 +201,27 @@ async fn set_up_test_suite(ts: &TestSuite, handle: &Handle) -> Result<(), Box<dy
                 let s4 = substrs[3].to_uppercase();
                 let s5 = substrs[4].to_uppercase();
                 if s3 == "IF" && s4 == "NOT" && s5 == "EXISTS" && substrs[5].find(".").is_some() {
-                    execute_table_ddl(ts, &stmt, handle).await?;
+                    execute_table_ddl(ts, &stmt, handle, rl).await?;
                     continue;
                 }
             }
             if substrs.len() > 2 && substrs[2].find(".").is_some() {
-                execute_table_ddl(ts, &stmt, handle).await?;
+                execute_table_ddl(ts, &stmt, handle, rl).await?;
             } else {
-                create_table(ts, &stmt, &limits, handle).await?;
+                create_table(ts, &stmt, &limits, handle, rl).await?;
             }
         } else if s2 == "NAMESPACE" || s2 == "USER" || s2 == "ROLE" {
             // CREATE/DROP NAMESPACE/USER/ROLE operations should use SystemRequest.
-            execute_ddl(ts, &stmt, handle).await?;
+            execute_ddl(ts, &stmt, handle, rl).await?;
         } else {
-            execute_table_ddl(ts, &stmt, handle).await?;
+            execute_table_ddl(ts, &stmt, handle, rl).await?;
         }
     }
 
     for (table, rows) in &ts.before_data {
         println!("Inserting {} rows into table '{}'", rows.len(), table);
         for mv in rows {
+            //println!("row={:?}", mv);
             let pres = PutRequest::new(&table)
                 .value(mv.clone_internal())
                 .execute(handle)
@@ -224,19 +246,27 @@ async fn set_up_test_suite(ts: &TestSuite, handle: &Handle) -> Result<(), Box<dy
     Ok(())
 }
 
-async fn tear_down_test_suite(ts: &mut TestSuite, handle: &Handle) -> Result<(), Box<dyn Error>> {
+async fn tear_down_test_suite(
+    ts: &mut TestSuite,
+    handle: &Handle,
+    rl: &mut RateLimiter,
+) -> Result<(), Box<dyn Error>> {
     // TODO
     //if !suite.DropTablesOnTearDown {
     //return
     //}
 
-    clean_up(ts, handle).await
+    clean_up(ts, handle, rl).await
 }
 
 #[async_recursion(?Send)]
-async fn clean_up(ts: &TestSuite, handle: &Handle) -> Result<(), Box<dyn Error>> {
+async fn clean_up(
+    ts: &TestSuite,
+    handle: &Handle,
+    rl: &mut RateLimiter,
+) -> Result<(), Box<dyn Error>> {
     for dep in &ts.dependencies {
-        clean_up(dep, handle).await?;
+        clean_up(dep, handle, rl).await?;
     }
 
     if ts.after_ddls.len() > 0 {
@@ -253,7 +283,7 @@ async fn clean_up(ts: &TestSuite, handle: &Handle) -> Result<(), Box<dyn Error>>
         let s2 = substrs[1].to_uppercase();
         if s2 == "NAMESPACE" || s2 == "USER" || s2 == "ROLE" {
             // CREATE/DROP NAMESPACE/USER/ROLE operations should use SystemRequest.
-            match execute_ddl(ts, &stmt, handle).await {
+            match execute_ddl(ts, &stmt, handle, rl).await {
                 Ok(_) => (),
                 Err(e) => {
                     // ignore ResourceNotFound error
@@ -264,7 +294,7 @@ async fn clean_up(ts: &TestSuite, handle: &Handle) -> Result<(), Box<dyn Error>>
                 }
             }
         } else {
-            match execute_table_ddl(ts, &stmt, handle).await {
+            match execute_table_ddl(ts, &stmt, handle, rl).await {
                 Ok(_) => (),
                 Err(e) => {
                     // Ignore TableNotFound and IndexNotFound errors.
@@ -340,7 +370,8 @@ async fn run_test_case(
         stmt = tmp;
     }
 
-    let mut consistency = Consistency::Eventual;
+    //let mut consistency = Consistency::Eventual;
+    let mut consistency = Consistency::Absolute;
     if upd_stmt.len() > 0 {
         if do_query_test(ts, tc, tr, handle, &consistency, &upd_stmt)
             .await
@@ -467,7 +498,7 @@ async fn run_test_case(
     }
 
     println!(
-        "FAIL: Got mismatch in unordered results: expected={} actual={}",
+        "FAIL: {display_name} got mismatch in unordered results: expected={} actual={}",
         expected_results.len(),
         actual_results.len()
     );
@@ -512,10 +543,13 @@ async fn do_query_test(
     }
 
     if let Err(e) = prep_res {
-        println!(
-            "FAIL: {} prepare({}) got unexpected error {}",
-            msg_prefix, stmt, e
-        );
+        // special-case error code for proxy-based tests
+        let errmsg = format!("{e}");
+        if errmsg.contains("Cannot execute this kind of query in a proxy-based environment") {
+            tr.skipped += 1;
+            return None;
+        }
+        println!("FAIL: {} prepare() got unexpected error {}", msg_prefix, e);
         tr.failed += 1;
         return None;
     }
@@ -523,8 +557,8 @@ async fn do_query_test(
     let ps = prep_res.unwrap().prepared_statement();
     if ps.is_empty() {
         println!(
-            "FAIL: {} prepare({}) did not return a prepared statement",
-            msg_prefix, stmt
+            "FAIL: {} prepare() did not return a prepared statement",
+            msg_prefix
         );
         tr.failed += 1;
         return None;
@@ -630,22 +664,31 @@ async fn create_table(
     stmt: &str,
     limits: &TableLimits,
     handle: &Handle,
+    rl: &mut RateLimiter,
 ) -> Result<(), Box<dyn Error>> {
+    rl.consume_units_with_timeout(1, 60000, true).await?;
+
     TableRequest::new("")
         .statement(stmt)
         .limits(limits)
         .execute(handle)
         .await?
-        .wait_for_completion_ms(handle, 3000, 50)
+        .wait_for_completion_ms(handle, 30000, 200)
         .await?;
     Ok(())
 }
 
-async fn execute_ddl(_ts: &TestSuite, stmt: &str, handle: &Handle) -> Result<(), Box<dyn Error>> {
+async fn execute_ddl(
+    _ts: &TestSuite,
+    stmt: &str,
+    handle: &Handle,
+    rl: &mut RateLimiter,
+) -> Result<(), Box<dyn Error>> {
+    rl.consume_units_with_timeout(1, 60000, true).await?;
     SystemRequest::new(stmt)
         .execute(handle)
         .await?
-        .wait_for_completion_ms(handle, 3000, 50)
+        .wait_for_completion_ms(handle, 30000, 200)
         .await?;
     Ok(())
 }
@@ -654,12 +697,14 @@ async fn execute_table_ddl(
     _ts: &TestSuite,
     stmt: &str,
     handle: &Handle,
+    rl: &mut RateLimiter,
 ) -> Result<(), Box<dyn Error>> {
+    rl.consume_units_with_timeout(1, 60000, true).await?;
     TableRequest::new("")
         .statement(stmt)
         .execute(handle)
         .await?
-        .wait_for_completion_ms(handle, 3000, 50)
+        .wait_for_completion_ms(handle, 30000, 200)
         .await?;
     Ok(())
 }

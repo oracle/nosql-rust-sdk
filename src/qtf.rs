@@ -24,6 +24,7 @@ use std::{
 
 use bigdecimal::{BigDecimal, Num};
 use serde_json::Value;
+//use tracing::debug;
 
 // TestSuite represents a query test suite used to test a specific functionality
 // and usually contains multiple query test cases.
@@ -685,7 +686,9 @@ pub fn read_data_file(file: &str) -> Result<HashMap<String, Vec<MapValue>>, Box<
             //if let Ok(v) = serde_json::from_str(&b) {
             match serde_json::from_str(&b) {
                 Ok(v) => {
-                    values.push(MapValue::from_json_object(&v)?);
+                    let val = MapValue::from_json_object(&v)?;
+                    //debug!("read value from json: {:?}", val);
+                    values.push(val);
                 }
                 Err(e) => {
                     println!(

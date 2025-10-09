@@ -15,7 +15,7 @@ use crate::reader::Reader;
 use crate::types::FieldValue;
 
 use std::result::Result;
-use tracing::trace;
+use tracing::debug;
 
 // FieldStepIter returns the value of a field in an input MapValue. It is
 // used by the driver to implement column references in the SELECT
@@ -49,7 +49,7 @@ impl FieldStepIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let sp = r.read_i32()?; // state_pos
-        trace!("\nFieldStepIter: result_reg={} state_pos={}\n", rr, sp);
+        debug!("\nFieldStepIter: result_reg={} state_pos={}\n", rr, sp);
         Ok(FieldStepIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -110,6 +110,10 @@ impl FieldStepIter {
 
             let mv = ctx_item.get_map_value()?;
             let result = mv.get_field_value(&self.field_name);
+            debug!(
+                "FSI{} field '{}' value={:?}",
+                self.result_reg, self.field_name, result
+            );
             if result.is_none() {
                 continue;
             }
@@ -119,10 +123,14 @@ impl FieldStepIter {
     }
 
     pub fn get_result(&self, req: &mut QueryRequest) -> FieldValue {
-        //println!("FieldStepIter.get_result");
-        req.get_result(self.result_reg)
+        let fv = req.get_result(self.result_reg);
+        debug!("FSI{} get_result={:?}", self.result_reg, fv);
+        // TODO: investigate why get_result is called without resetting
+        req.set_result(self.result_reg, fv.clone_internal());
+        fv
     }
     pub fn set_result(&self, req: &mut QueryRequest, result: FieldValue) {
+        debug!("FSI{} set_result({:?})", self.result_reg, result);
         req.set_result(self.result_reg, result);
     }
     pub fn reset(&mut self) -> Result<(), NoSQLError> {

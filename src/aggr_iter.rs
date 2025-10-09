@@ -19,7 +19,7 @@ use oracle_nosql_rust_sdk_derive::add_planiter_fields;
 use bigdecimal::BigDecimal;
 use std::cmp::Ordering;
 use std::result::Result;
-use tracing::trace;
+use tracing::debug;
 
 // AggrIterData is a struct that is common to several aggregation iterators.
 #[derive(Debug)]
@@ -86,7 +86,7 @@ impl FuncSumIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let sp = r.read_i32()?; // state_pos
-        trace!("\nFuncSumIter: result_reg={} state_pos={}\n", rr, sp);
+        debug!("\nFuncSumIter: result_reg={} state_pos={}\n", rr, sp);
         Ok(FuncSumIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -222,9 +222,12 @@ impl FuncSumIter {
     }
 
     pub fn get_result(&self, req: &mut QueryRequest) -> FieldValue {
-        req.get_result(self.result_reg)
+        let fv = req.get_result(self.result_reg);
+        debug!("AI{} get_result={:?}", self.result_reg, fv);
+        fv
     }
     pub fn set_result(&self, req: &mut QueryRequest, result: FieldValue) {
+        debug!("AI{} set_result({:?})", self.result_reg, result);
         req.set_result(self.result_reg, result);
     }
     pub fn reset(&mut self) -> Result<(), NoSQLError> {
@@ -306,7 +309,6 @@ impl FuncMinMaxIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let _ = r.read_i32()?; // state_pos
-                               //println!( "\n . FuncMinMaxIter: result_reg={} state_pos={}\n", rr, r.read_i32()?);
         Ok(FuncMinMaxIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -345,6 +347,11 @@ impl FuncMinMaxIter {
             return Ok(false);
         }
 
+        debug!(
+            "MMF{} input_iter.kind={:?}",
+            self.result_reg,
+            self.input_iter.get_kind()
+        );
         loop {
             if self.input_iter.next(req, handle).await? == false {
                 return Ok(true);
@@ -353,6 +360,7 @@ impl FuncMinMaxIter {
             //if (rcb.getTraceLevel() >= 2) {
             //rcb.trace("Summing up value " + val);
             //}
+            debug!("MMF{} summing value={:?}", self.result_reg, val);
             self.min_max_new_value(val)?;
         }
     }
@@ -373,23 +381,21 @@ impl FuncMinMaxIter {
             self.data.min_max = val;
             return Ok(());
         }
-        let cmp = compare_atomics_total_order(&self.data.min_max, &val, false);
-        //if (rcb.getTraceLevel() >= 3) {
-        //rcb.trace("Compared values: \n" + state.theMinMax + "\n" + val +
-        //"\ncomp res = " + cmp);
-        //}
+        let cmp = compare_atomics_total_order(&val, &self.data.min_max, false);
+        debug!(
+            "MMF{} comp({:?}, {:?})={:?}",
+            self.result_reg, val, self.data.min_max, cmp
+        );
         if self.func_code == FuncCode::FnMin {
-            if cmp != Ordering::Greater {
-                return Ok(());
-            }
-        } else {
             if cmp != Ordering::Less {
                 return Ok(());
             }
+        } else {
+            if cmp != Ordering::Greater {
+                return Ok(());
+            }
         }
-        //if (rcb.getTraceLevel() >= 2) {
-        //rcb.trace("Setting min/max to " + val);
-        //}
+        debug!("MMF{} setting min_max={:?}", self.result_reg, val);
         self.data.min_max = val;
         Ok(())
     }

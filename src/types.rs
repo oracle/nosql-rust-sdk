@@ -1262,7 +1262,7 @@ impl TopologyInfo {
     //return reflect.DeepEqual(ti.shardIDs, otherTopo.shardIDs)
 }
 
-pub(crate) fn sort_results(
+pub(crate) fn compare_results(
     r1: &MapValue,
     r2: &MapValue,
     sort_fields: &Vec<String>,
@@ -1281,7 +1281,7 @@ pub(crate) fn sort_results(
             return Ordering::Greater;
         }
         let comp =
-            compare_atomics_total_order_sortspec(ov2.unwrap(), ov1.unwrap(), &sort_specs[i], false);
+            compare_atomics_total_order_sortspec(ov1.unwrap(), ov2.unwrap(), &sort_specs[i], false);
         if comp != Ordering::Equal {
             return comp;
         }
@@ -1349,11 +1349,12 @@ pub(crate) fn compare_atomics_total_order(
             match tc1 {
                 FieldType::Integer => {
                     let iv1 = i32::from_field(v1).unwrap();
-                    return iv1.cmp(&iv0);
+                    return iv0.cmp(&iv1);
                 }
                 FieldType::Long => {
                     let iv1 = i64::from_field(v1).unwrap();
-                    return iv1.cmp(&(iv0 as i64));
+                    let tmp0 = iv0 as i64;
+                    return tmp0.cmp(&iv1);
                 }
                 FieldType::Double => {
                     let iv1 = f64::from_field(v1).unwrap();
@@ -1363,7 +1364,7 @@ pub(crate) fn compare_atomics_total_order(
                 FieldType::Number => {
                     let bd1 = BigDecimal::from_field(v1).unwrap();
                     let bd0 = BigDecimal::default() + iv0;
-                    return bd1.cmp(&bd0);
+                    return bd0.cmp(&bd1);
                 }
                 _ => {
                     return Ordering::Less;
@@ -1375,11 +1376,11 @@ pub(crate) fn compare_atomics_total_order(
             match tc1 {
                 FieldType::Integer => {
                     let iv1 = i32::from_field(v1).unwrap() as i64;
-                    return iv1.cmp(&iv0);
+                    return iv0.cmp(&iv1);
                 }
                 FieldType::Long => {
                     let iv1 = i64::from_field(v1).unwrap();
-                    return iv1.cmp(&iv0);
+                    return iv0.cmp(&iv1);
                 }
                 FieldType::Double => {
                     let iv1 = f64::from_field(v1).unwrap();
@@ -1389,7 +1390,7 @@ pub(crate) fn compare_atomics_total_order(
                 FieldType::Number => {
                     let bd1 = BigDecimal::from_field(v1).unwrap();
                     let bd0 = BigDecimal::default() + iv0;
-                    return bd1.cmp(&bd0);
+                    return bd0.cmp(&bd1);
                 }
                 _ => {
                     return Ordering::Less;
@@ -1414,7 +1415,7 @@ pub(crate) fn compare_atomics_total_order(
                 FieldType::Number => {
                     let bd1 = BigDecimal::from_field(v1).unwrap();
                     let bd0 = BigDecimal::try_from(fv0).unwrap();
-                    return bd1.cmp(&bd0);
+                    return bd0.cmp(&bd1);
                 }
                 _ => {
                     return Ordering::Less;
@@ -1427,21 +1428,21 @@ pub(crate) fn compare_atomics_total_order(
                 FieldType::Integer => {
                     let iv1 = i32::from_field(v1).unwrap();
                     let bd1 = BigDecimal::default() + iv1;
-                    return bd1.cmp(&bd0);
+                    return bd0.cmp(&bd1);
                 }
                 FieldType::Long => {
                     let iv1 = i64::from_field(v1).unwrap();
                     let bd1 = BigDecimal::default() + iv1;
-                    return bd1.cmp(&bd0);
+                    return bd0.cmp(&bd1);
                 }
                 FieldType::Double => {
                     let fv1 = f64::from_field(v1).unwrap();
                     let bd1 = BigDecimal::try_from(fv1).unwrap();
-                    return bd1.cmp(&bd0);
+                    return bd0.cmp(&bd1);
                 }
                 FieldType::Number => {
                     let bd1 = BigDecimal::from_field(v1).unwrap();
-                    return bd1.cmp(&bd0);
+                    return bd0.cmp(&bd1);
                 }
                 _ => {
                     return Ordering::Less;
@@ -1453,7 +1454,7 @@ pub(crate) fn compare_atomics_total_order(
             match tc1 {
                 FieldType::Timestamp => {
                     let tv1 = NoSQLDateTime::from_field(v1).unwrap();
-                    return tv1.cmp(&tv0);
+                    return tv0.cmp(&tv1);
                 }
                 FieldType::Integer => {
                     return Ordering::Greater;
@@ -1472,7 +1473,7 @@ pub(crate) fn compare_atomics_total_order(
                         return Ordering::Less;
                     }
                     if let Ok(tv1) = NoSQLDateTime::from_field(v1) {
-                        return tv1.cmp(&tv0);
+                        return tv0.cmp(&tv1);
                     }
                     return Ordering::Less;
                 }
@@ -1484,7 +1485,7 @@ pub(crate) fn compare_atomics_total_order(
             match tc1 {
                 FieldType::String => {
                     let sv1 = String::from_field(v1).unwrap();
-                    return sv1.cmp(&sv0);
+                    return sv0.cmp(&sv1);
                 }
                 FieldType::Integer => {
                     return Ordering::Greater;
@@ -1504,7 +1505,7 @@ pub(crate) fn compare_atomics_total_order(
                     }
                     let tv1 = NoSQLDateTime::from_field(v1).unwrap();
                     if let Ok(tv0) = NoSQLDateTime::from_field(v0) {
-                        return tv1.cmp(&tv0);
+                        return tv0.cmp(&tv1);
                     }
                     return Ordering::Greater;
                 }
@@ -1514,7 +1515,7 @@ pub(crate) fn compare_atomics_total_order(
                     }
                     let bv1 = NoSQLBinary::from_field(v1).unwrap();
                     let sv1 = BASE64_STANDARD.encode(bv1.data);
-                    return sv1.cmp(&sv0);
+                    return sv0.cmp(&sv1);
                 }
                 _ => return Ordering::Less,
             }
@@ -1524,7 +1525,7 @@ pub(crate) fn compare_atomics_total_order(
             match tc1 {
                 FieldType::Boolean => {
                     let bv1 = bool::from_field(v1).unwrap();
-                    return bv1.cmp(&bv0);
+                    return bv0.cmp(&bv1);
                 }
                 FieldType::Integer => {
                     return Ordering::Greater;
@@ -1552,7 +1553,7 @@ pub(crate) fn compare_atomics_total_order(
             match tc1 {
                 FieldType::Binary => {
                     let bv1 = NoSQLBinary::from_field(v1).unwrap();
-                    return bv1.data.cmp(&bv0.data);
+                    return bv0.data.cmp(&bv1.data);
                 }
                 FieldType::Integer => {
                     return Ordering::Greater;
@@ -1575,7 +1576,7 @@ pub(crate) fn compare_atomics_total_order(
                     }
                     let sv1 = String::from_field(v1).unwrap();
                     let sv0 = BASE64_STANDARD.encode(bv0.data);
-                    return sv1.cmp(&sv0);
+                    return sv0.cmp(&sv1);
                 }
                 FieldType::Boolean => {
                     return Ordering::Greater;

@@ -14,7 +14,7 @@ use crate::reader::Reader;
 use crate::types::FieldValue;
 
 use std::result::Result;
-use tracing::trace;
+use tracing::debug;
 
 // ConstIter represents a reference to a constant value in the query.
 // Such a reference will need to be "executed" at the driver side when
@@ -48,7 +48,7 @@ impl ConstIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let sp = r.read_i32()?; // state_pos
-        trace!("\nConstIter: result_reg={} state_pos={}\n", rr, sp);
+        debug!("\nConstIter: result_reg={} state_pos={}\n", rr, sp);
         Ok(ConstIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -61,9 +61,9 @@ impl ConstIter {
 }
 
 impl ConstIter {
-    pub fn open(&mut self, req: &mut QueryRequest, _handle: &Handle) -> Result<(), NoSQLError> {
+    pub fn open(&mut self, _req: &mut QueryRequest, _handle: &Handle) -> Result<(), NoSQLError> {
         self.state = PlanIterState::Open;
-        self.set_result(req, self.value.clone_internal());
+        //self.set_result(req, self.value.clone_internal());
         Ok(())
     }
     /*
@@ -85,12 +85,12 @@ impl ConstIter {
         self.state = PlanIterState::Done;
         Ok(true)
     }
-    pub fn get_result(&self, req: &mut QueryRequest) -> FieldValue {
-        //println!("ConstIter.get_result");
-        req.get_result(self.result_reg)
+    pub fn get_result(&self, _req: &mut QueryRequest) -> FieldValue {
+        // return clone of value so we don't reset our value to Uninitialized
+        self.value.clone_internal()
     }
-    pub fn set_result(&self, req: &mut QueryRequest, result: FieldValue) {
-        req.set_result(self.result_reg, result);
+    pub fn set_result(&self, _req: &mut QueryRequest, _result: FieldValue) {
+        // const iter never changes its initial value
     }
     pub fn reset(&mut self) -> Result<(), NoSQLError> {
         self.state = PlanIterState::Open;

@@ -17,7 +17,7 @@ use crate::types::{compare_field_values, FieldValue};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::result::Result;
-use tracing::trace;
+use tracing::debug;
 
 #[add_planiter_fields]
 #[derive(Debug, Default, Clone)]
@@ -33,7 +33,7 @@ impl CollectIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let sp = r.read_i32()?; // state_pos
-        trace!("\nCollectIter: result_reg={} state_pos={}\n", rr, sp);
+        debug!("\nCollectIter: result_reg={} state_pos={}\n", rr, sp);
         Ok(CollectIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -94,7 +94,7 @@ impl CollectIter {
         PlanIterKind::Collect
     }
     pub fn get_result(&self, req: &mut QueryRequest) -> FieldValue {
-        //println!("CollectIter.get_result");
+        debug!("CollectIter.get_result");
         req.get_result(self.result_reg)
     }
     pub fn set_result(&self, req: &mut QueryRequest, result: FieldValue) {
@@ -114,7 +114,7 @@ impl CollectIter {
         handle: &Handle,
     ) -> Result<bool, NoSQLError> {
         if self.data.state == PlanIterState::Done {
-            //println!("CollectIter.next(): already done");
+            debug!("CollectIter.next(): already done");
             return Ok(false);
         }
 
@@ -204,7 +204,7 @@ impl CollectIter {
 
         // we already moved all values out
         if reset == false {
-            //println!("WARN: CollectIter.get_aggr_value called with reset==false");
+            debug!("WARN: CollectIter.get_aggr_value called with reset==false");
         }
         self.data.reset();
         Ok(Some(FieldValue::Array(vals)))
