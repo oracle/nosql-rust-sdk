@@ -177,7 +177,11 @@ async fn set_up_test_suite(
     }
 
     // Set a table limit that are required for cloud tests.
-    let limits = TableLimits::provisioned(5000, 5000, 3);
+    let units = std::env::var("QTF_LIMIT_UNITS")
+        .ok()
+        .and_then(|units| units.parse::<u16>().ok())
+        .unwrap_or(500);
+    let limits = TableLimits::provisioned(units, units, 3);
 
     if ts.before_ddls.len() > 0 {
         println!("Executing suite {} DDLs on setup:", ts.name);
@@ -612,7 +616,7 @@ async fn do_query_test(
 
         println!(
             "FAIL: {msg_prefix} should have failed with an error \
-			that contains one of the messages: {:?}",
+            that contains one of the messages: {:?}",
             tc.expect_err_messages
         );
         tr.failed += 1;

@@ -131,10 +131,6 @@ impl TestSuite {
     // get_test_case_names returns test case names in the test suite.
     // the returned test cases names are sorted in lexical order.
     pub fn get_test_case_names(&self) -> Result<Vec<String>, Box<dyn Error>> {
-        println!(
-            "gtcn: name={} dir={} tcdir={}",
-            self.name, self.dir, self.test_case_dir
-        );
         let file_names = get_subdirs(&self.test_case_dir, false)?;
         let mut tc_names: Vec<String> = Vec::new();
         for name in file_names {
@@ -436,7 +432,7 @@ impl TestRunner {
 
                 //Parsing s1=run-sec-index: s2=q(), sub_strs=["run-sec-index ", " q() ", " expres"]
 
-                println!("Parsing s1={}: s2={}, sub_strs={:?}", s1, s2, sub_strs);
+                //println!("Parsing s1={}: s2={}, sub_strs={:?}", s1, s2, sub_strs);
                 ts.test_result_dir = sjoin(&ts.dir, sub_strs[2].trim());
 
                 // example: run-gb = q(dep_dir1, dep_dir2, //dep_dir3) = expres
@@ -840,6 +836,7 @@ pub fn parse_excluded_tests(
 
     let mut excluded_tests: HashMap<String, HashMap<String, bool>> = HashMap::new();
     for x in lines {
+        if x.starts_with('#') { continue };
         let sub_strs = ssplit(&x, "/");
         let testsuite = sub_strs[0].clone();
         let testcase: String;
