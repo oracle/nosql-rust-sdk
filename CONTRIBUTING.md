@@ -1,6 +1,6 @@
 # Contributing to the Oracle NoSQL Database Cloud Service Rust SDK
 
-*Copyright (c) 2024, 2025 Oracle and/or its affiliates. All rights reserved.*
+*Copyright (c) 2024, 2026 Oracle and/or its affiliates. All rights reserved.*
 
 The target readers of this document are those who want to contribute to the
 Oracle NoSQL Database Rust SDK project, including but not limited to contributing
