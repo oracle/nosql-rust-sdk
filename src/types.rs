@@ -1242,7 +1242,7 @@ pub(crate) fn string_to_rfc3339(s: &str) -> Result<DateTime<FixedOffset>, NoSQLE
 
 // TopologyInfo represents the NoSQL database topology information required for
 // query execution.
-#[derive(Default, Debug, Eq, PartialEq, Clone)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub(crate) struct TopologyInfo {
     // seq_num represents the sequence number of the topology.
     pub seq_num: i32,
@@ -1260,6 +1260,15 @@ impl TopologyInfo {
     //sort.Ints(ti.shardIDs)
     //sort.Ints(otherTopo.shardIDs)
     //return reflect.DeepEqual(ti.shardIDs, otherTopo.shardIDs)
+}
+
+impl Default for TopologyInfo {
+    fn default() -> Self {
+        Self {
+            seq_num: -1,
+            shard_ids: Vec::default()
+        }
+    }
 }
 
 pub(crate) fn compare_results(

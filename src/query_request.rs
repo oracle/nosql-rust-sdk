@@ -203,10 +203,11 @@ impl QueryRequest {
         if let Some(t) = &prepared_statement.topology_info {
             ti = t.clone();
         } else {
-            panic!(
-                "Invalid prepared statement passed to new_prepared! Missing toploogy info. ps={:?}",
-                prepared_statement
-            );
+            ti = TopologyInfo::default();
+            //panic!(
+                //"Invalid prepared statement passed to new_prepared! Missing toploogy info. ps={:?}",
+                //prepared_statement
+            //);
         }
         QueryRequest {
             prepared_statement: prepared_statement.clone(),
