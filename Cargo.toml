@@ -30,7 +30,7 @@ bigdecimal = "0.4.5"
 derive_builder = { version = "0.20.0" }
 oracle-nosql-rust-sdk-derive = { version = "0.1" }
 async-recursion = "1.1.1"
-openssl =  { version = "0.10.66", features = ["vendored"] }
+openssl =  { version = "0.10.66" }
 base64ct = { version = "1.6.0", features = ["alloc", "std"] }
 bytes = "1.5.0"
 rust-ini = "0.21.0"

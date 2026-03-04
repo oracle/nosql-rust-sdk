@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024, 2025 Oracle and/or its affiliates. All rights reserved.
+// Copyright (c) 2024, 2026 Oracle and/or its affiliates. All rights reserved.
 //
 // Licensed under the Universal Permissive License v 1.0 as shown at
 //  https://oss.oracle.com/licenses/upl/
@@ -60,8 +60,12 @@ async fn qtf_test() -> Result<(), Box<dyn Error>> {
     let runner = TestRunner::new(&qtf_root_dir)?;
     let mut totals = SuiteResults::default();
 
-    // TODO: cmdline arg? environment?
-    let mut rl = RateLimiter::new(3.0);
+    const DEFAULT_RATE_LIMIT: f64 = 3.0;
+    let ddl_rate_limit = std::env::var("QTF_DDL_RATE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_RATE_LIMIT);
+    let mut rl = RateLimiter::new(ddl_rate_limit);
 
     for name in &runner.dir_names {
         if runner.is_excluded_test_suite(name) {
@@ -103,7 +107,7 @@ async fn qtf_test() -> Result<(), Box<dyn Error>> {
             Err(e) => {
                 println!("FAIL: Test suite {name} failed: {}", e);
                 totals.failed += runner.get_num_tests(name);
-                tear_down_test_suite(&mut ts, &handle, &mut rl).await?;
+                let _ = tear_down_test_suite(&mut ts, &handle, &mut rl).await;
             }
         }
     }
@@ -177,9 +181,9 @@ async fn set_up_test_suite(
     }
 
     // Set a table limit that are required for cloud tests.
-    let units = std::env::var("QTF_LIMIT_UNITS")
+    let units: i32 = std::env::var("QTF_LIMIT_UNITS")
         .ok()
-        .and_then(|units| units.parse::<u16>().ok())
+        .and_then(|units| units.parse::<i32>().ok())
         .unwrap_or(500);
     let limits = TableLimits::provisioned(units, units, 3);
 
@@ -190,7 +194,9 @@ async fn set_up_test_suite(
     // TODO: if total units for table creation exceeds max, set limit for each to 1/Nth
 
     for stmt in &ts.before_ddls {
-        println!("  {}", stmt);
+        let now = std::time::SystemTime::now();
+        let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH).expect("Time went backwards");
+        println!("  {} {}", duration_since_epoch.as_secs(), stmt);
         let substrs = snsplit(10, stmt, " ");
         if substrs.len() < 2 {
             continue;
@@ -278,7 +284,9 @@ async fn clean_up(
     }
 
     for stmt in &ts.after_ddls {
-        println!("  {}", stmt);
+        let now = std::time::SystemTime::now();
+        let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH).expect("Time went backwards");
+        println!("  {} {}", duration_since_epoch.as_secs(), stmt);
         let substrs = snsplit(3, stmt, " ");
         if substrs.len() < 2 {
             continue;
