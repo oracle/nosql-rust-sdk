@@ -17,7 +17,7 @@ use crate::types::{FieldType, FieldValue};
 
 use bigdecimal::BigDecimal;
 use std::result::Result;
-use tracing::trace;
+use tracing::debug;
 
 // An instance of this iterator implements either addition/substraction among
 // two or more input values, or multiplication/division among two or more input
@@ -55,7 +55,7 @@ impl ArithOpIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let sp = r.read_i32()?; // state_pos
-        trace!("\nArithOpIter: result_reg={} state_pos={}\n", rr, sp);
+        debug!("\nArithOpIter: result_reg={} state_pos={}\n", rr, sp);
         let mut a = ArithOpIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -124,7 +124,17 @@ impl ArithOpIter {
                 return Ok(false);
             }
             // Take the value from the register...
+            debug!(
+                "AOI{} arg_iter[{}].kind={:?}",
+                self.result_reg,
+                i,
+                self.arg_iters[i].get_kind()
+            );
             let arg_value = self.arg_iters[i].get_result(req);
+            debug!(
+                "AOI{} arg_iter[{}].result={:?}",
+                self.result_reg, i, arg_value
+            );
             if arg_value.is_null() {
                 self.set_result(req, FieldValue::Null);
                 self.state = PlanIterState::Done;
@@ -284,10 +294,12 @@ impl ArithOpIter {
         Ok(true)
     }
     pub fn get_result(&self, req: &mut QueryRequest) -> FieldValue {
-        //println!("ArithOpIter.get_result");
-        req.get_result(self.result_reg)
+        let fv = req.get_result(self.result_reg);
+        debug!("AOI{} get_result={:?}", self.result_reg, fv);
+        fv
     }
     pub fn set_result(&self, req: &mut QueryRequest, result: FieldValue) {
+        debug!("AOI{} set_result({:?})", self.result_reg, result);
         req.set_result(self.result_reg, result);
     }
     pub fn reset(&mut self) -> Result<(), NoSQLError> {

@@ -16,7 +16,7 @@ use crate::reader::Reader;
 use crate::types::{FieldValue, MapValue};
 
 use std::result::Result;
-use tracing::{debug, trace};
+use tracing::debug;
 
 // SfwIter is used for:
 // (a) project out result columns that do not appear in the SELECT list of
@@ -49,7 +49,7 @@ impl SfwIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let sp = r.read_i32()?; // state_pos
-        trace!("\nSfwIter: result_reg={} state_pos={}\n", rr, sp);
+        debug!("\nSfwIter: result_reg={} state_pos={}\n", rr, sp);
         let s = SfwIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -67,7 +67,7 @@ impl SfwIter {
 
             ..Default::default()
         };
-        debug!("SFW: from_iter={:?}", s.from_iter);
+        debug!("SFW{}: from_iter={:?}", s.result_reg, s.from_iter);
         Ok(s)
     }
 }
@@ -97,7 +97,7 @@ impl Clone for SfwIterData {
 
 impl SfwIterData {
     fn reset(&mut self) {
-        debug!("SFW:data.reset()");
+        debug!("SfwIterData:data.reset()");
         self.state = PlanIterState::Uninitialized;
         self.num_results = 0;
         self.gb_tuple = Vec::new();
@@ -129,10 +129,12 @@ impl SfwIter {
         PlanIterKind::Sfw
     }
     pub fn get_result(&self, req: &mut QueryRequest) -> FieldValue {
-        trace!("SfwIter.get_result");
-        req.get_result(self.result_reg)
+        let fv = req.get_result(self.result_reg);
+        debug!("SFW{} get_result={:?}", self.result_reg, fv);
+        fv
     }
     pub fn set_result(&self, req: &mut QueryRequest, result: FieldValue) {
+        debug!("SFW{} set_result({:?})", self.result_reg, result);
         req.set_result(self.result_reg, result);
     }
     pub fn get_state(&self) -> PlanIterState {
@@ -170,10 +172,10 @@ impl SfwIter {
         }
         // while loop for skipping offset results
         loop {
-            debug!("SfwIter.next(): computing next result");
+            debug!("SFW{} next(): computing next result", self.result_reg);
             let more = self.compute_next_result(req, handle).await?;
             if more == false {
-                trace!("SfwIter.next(): computing returned false");
+                debug!("SWF{} next(): computing returned false", self.result_reg);
                 return Ok(false);
             }
             // Even though we have a result, the state may be DONE. This is the
@@ -197,16 +199,22 @@ impl SfwIter {
         req: &mut QueryRequest,
         handle: &Handle,
     ) -> Result<bool, NoSQLError> {
-        debug!("SfwIter compute_next_result: looping...");
+        debug!("SFW{} compute_next_result: looping...", self.result_reg);
         // while loop for group by
         loop {
             let mut more = self.from_iter.next(req, handle).await?;
             if more == false {
                 if req.reached_limit == false {
-                    debug!("SfwIter.compute_next(): reached limit == false: setting done()");
+                    debug!(
+                        "SFW{} compute_next(): reached limit == false: setting done()",
+                        self.result_reg
+                    );
                     self.done();
                 }
-                debug!("SFW: more==false num_gb_cols={}", self.num_gb_columns);
+                debug!(
+                    "SFW{}: more==false num_gb_cols={}",
+                    self.result_reg, self.num_gb_columns
+                );
                 if self.num_gb_columns >= 0 {
                     return self.produce_last_group(req, handle);
                 }
@@ -218,7 +226,7 @@ impl SfwIter {
             // computation if this is not a grouping SFW and it has an offset
             // that has not been reached yet.
             if self.num_gb_columns < 0 && self.data.offset > 0 {
-                debug!("SFW: offset={}", self.data.offset);
+                debug!("SFW{}: offset={}", self.result_reg, self.data.offset);
                 return Ok(true);
             }
             let mut num_cols = self.column_iters.len();
@@ -227,7 +235,8 @@ impl SfwIter {
             }
 
             debug!(
-                "num_cols={} col_iters.len()={} num_gb_cols={}",
+                "SFW{} num_cols={} col_iters.len()={} num_gb_cols={}",
+                self.result_reg,
                 num_cols,
                 self.column_iters.len(),
                 self.num_gb_columns
@@ -237,18 +246,27 @@ impl SfwIter {
                 more = self.column_iters[i].next(req, handle).await?;
                 if more == false {
                     if self.num_gb_columns > 0 {
+                        debug!(
+                            "SFW{} col={} more==false, num_gb_columns={}, resetting",
+                            self.result_reg, i, self.num_gb_columns
+                        );
                         self.column_iters[i].reset()?;
                         break;
                     }
                     // TODO: why Null here?
+                    debug!(
+                        "SFW{} col={} more==false, num_gb_columns={}, setting result to Null",
+                        self.result_reg, i, self.num_gb_columns
+                    );
                     self.column_iters[i].set_result(req, FieldValue::Null);
                 }
+                debug!("SFW{} col={} resetting column_iter", self.result_reg, i);
                 self.column_iters[i].reset()?;
                 i += 1;
             }
 
             if i < num_cols {
-                trace!("i={}, continuing", i);
+                debug!("SFW{} i={}, continuing", self.result_reg, i);
                 continue;
             }
 
@@ -258,12 +276,19 @@ impl SfwIter {
                 }
                 let mut m = MapValue::new();
                 for i in 0..self.column_iters.len() {
+                    debug!(
+                        "SFW{} col[{}]='{}' kind={:?}",
+                        self.result_reg,
+                        i,
+                        self.column_names[i],
+                        self.column_iters[i].get_kind()
+                    );
                     m.put_field_value(
                         self.column_names[i].as_str(),
                         self.column_iters[i].get_result(req),
                     );
                 }
-                debug!("num_gb_cols<0: set result={:?}", m);
+                debug!("SFW{} num_gb_cols<0: set result={:?}", self.result_reg, m);
                 self.set_result(req, FieldValue::Map(m));
                 break;
             }
@@ -291,7 +316,8 @@ impl SfwIter {
         let gb_cols = self.num_gb_columns as usize;
 
         debug!(
-            "GIT: num_cols={num_cols} gb_cols={gb_cols} tuple_len={}",
+            "SFW{} GIT: num_cols={num_cols} gb_cols={gb_cols} tuple_len={}",
+            self.result_reg,
             self.data.gb_tuple.len()
         );
         // If this is the very first input tuple, start the first group and
@@ -316,17 +342,23 @@ impl SfwIter {
         // Compare the current input tuple with the current group tuple.
         let mut j = 0;
         for i in 0..gb_cols {
-            j = i;
             // move the value out of the column iterator
             let newval = self.column_iters[j].get_result(req);
             let curval = &self.data.gb_tuple[j];
             let equals = &newval == curval;
+            debug!(
+                "comparing col={} {:?} to {:?} returns {}",
+                i, newval, curval, equals
+            );
             // ...and then put it back
             self.column_iters[j].set_result(req, newval);
             if equals == false {
                 break;
             }
+            j += 1;
         }
+
+        debug!("j={j} gb_cols={gb_cols}");
 
         // If the input tuple is in current group, update the aggregate
         // functions and go back to compute the next input tuple.
@@ -341,12 +373,22 @@ impl SfwIter {
 
         // Input tuple starts new group. We must finish up the current group,
         // produce a result (output tuple) from it, and init the new group.
+        debug!("SFW{} new group: aggregating", self.result_reg);
 
         // 1. Get the final aggregate values for the current group and store
         //    them in theGBTuple.
         for i in gb_cols..num_cols {
+            debug!(
+                "SFW{} column_iters[{}].kind={:?}",
+                self.result_reg,
+                i,
+                self.column_iters[i].get_kind()
+            );
             if let Some(v) = self.column_iters[i].get_aggr_value(req, true)? {
-                trace!("aggr_value for column {i} is {:?}", v);
+                debug!(
+                    "SFW{} aggr_value for column {i} is {:?}",
+                    self.result_reg, v
+                );
                 self.data.gb_tuple[i] = v;
             } else {
                 return ia_err!("no aggr value in column iterator");
@@ -361,15 +403,21 @@ impl SfwIter {
                 std::mem::take(&mut self.data.gb_tuple[i]),
             );
         }
+        debug!("SFW{} new MV={:?}", self.result_reg, m);
         self.set_result(req, FieldValue::Map(m));
 
         // 3. Put the values of the grouping columns into the GB tuple
         for i in 0..gb_cols {
             self.data.gb_tuple[i] = self.column_iters[i].get_result(req);
+            debug!(
+                "SFW{} gb_tuple[{}]={:?}",
+                self.result_reg, i, self.data.gb_tuple[i]
+            );
         }
 
         // 4. Compute the values of the aggregate functions.
         for i in gb_cols..num_cols as usize {
+            debug!("SFW{} compute aggr i={}", self.result_reg, i);
             let _ = self.column_iters[i].next(req, handle).await?;
             let _ = self.column_iters[i].reset()?;
         }
@@ -383,13 +431,13 @@ impl SfwIter {
         _handle: &Handle,
     ) -> Result<bool, NoSQLError> {
         if req.reached_limit {
-            debug!("PLG: reached limit");
+            debug!("SFW{} PLG: reached limit", self.result_reg);
             return Ok(false);
         }
 
         // If there is no group, return false.
         if self.data.gb_tuple.len() == 0 {
-            debug!("PLG: no last group");
+            debug!("SFW{} PLG: no last group", self.result_reg);
             return Ok(false);
         }
         let num_cols = self.column_iters.len();
@@ -405,13 +453,16 @@ impl SfwIter {
 
         for i in gb_cols..num_cols {
             if let Some(v) = self.column_iters[i].get_aggr_value(req, true)? {
-                debug!("aggr_value for column {i} is {:?}", v);
+                debug!(
+                    "SFW{} aggr_value for column {i} is {:?}",
+                    self.result_reg, v
+                );
                 m.put_field_value(&self.column_names[i], v);
             } else {
                 return ia_err!("no aggr value in column iterator");
             }
         }
-        debug!("PLG: result={:?}", m);
+        debug!("SFW{} PLG: result={:?}", self.result_reg, m);
         self.set_result(req, FieldValue::Map(m));
 
         return Ok(true);

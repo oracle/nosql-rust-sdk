@@ -203,10 +203,11 @@ impl QueryRequest {
         if let Some(t) = &prepared_statement.topology_info {
             ti = t.clone();
         } else {
-            panic!(
-                "Invalid prepared statement passed to new_prepared! Missing toploogy info. ps={:?}",
-                prepared_statement
-            );
+            ti = TopologyInfo::default();
+            //panic!(
+                //"Invalid prepared statement passed to new_prepared! Missing toploogy info. ps={:?}",
+                //prepared_statement
+            //);
         }
         QueryRequest {
             prepared_statement: prepared_statement.clone(),
@@ -871,10 +872,10 @@ impl QueryRequest {
         }
         let mut r = Reader::new().from_bytes(v);
         self.prepared_statement.driver_query_plan = deserialize_plan_iter(&mut r)?;
-        //println!(
-        //"driver query plan:\n{:?}",
-        //self.prepared_statement.driver_query_plan
-        //);
+        trace!(
+            "driver query plan:\n{:?}",
+            self.prepared_statement.driver_query_plan
+        );
         if self.prepared_statement.driver_query_plan.get_kind() == PlanIterKind::Empty {
             return Ok(());
         }

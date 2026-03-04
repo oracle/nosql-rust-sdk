@@ -13,7 +13,6 @@ use crate::reader::Reader;
 use crate::types::{OpCode, TableLimits, TableState};
 use crate::writer::Writer;
 use std::result::Result;
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 /// Struct used for creating or modifying a table in the NoSQL Database.
@@ -389,7 +388,7 @@ impl TableResult {
             // TODO: namespace? Java sdk doesn't add it...?
 
             if !first_loop {
-                sleep(delay);
+                tokio::time::sleep(delay).await;
             }
 
             let res = get_request.execute(h).await?;

@@ -13,7 +13,6 @@ use crate::reader::Reader;
 use crate::types::{OpCode, OperationState};
 use crate::writer::Writer;
 use std::result::Result;
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 /// Struct used for on-premise-only requests.
@@ -239,7 +238,7 @@ impl SystemResult {
             }
 
             if !first_loop {
-                sleep(delay);
+                tokio::time::sleep(delay).await;
             }
 
             let res = SystemStatusRequest::new(self.operation_id.as_str())

@@ -14,15 +14,15 @@ use crate::plan_iter::{Location, PlanIterKind, PlanIterState};
 use crate::query_request::QueryRequest;
 use crate::reader::Reader;
 use crate::sort_iter::SortSpec;
-use crate::types::{sort_results, FieldValue, MapValue};
+use crate::types::{compare_results, FieldValue, MapValue};
 use crate::writer::Writer;
 
 use num_enum::TryFromPrimitive;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::mem::take;
 use std::result::Result;
-use tracing::trace;
+use tracing::debug;
 
 // ReceiveIter requests and receives results from the proxy. For sorting
 // queries, it performs a merge sort of the received results. It also
@@ -97,12 +97,12 @@ pub(crate) struct ReceiveIterData {
     scanner: RemoteScanner,
 
     // The remote scanners used for sorting queries. For all-shard queries
-    // there is one RemoreScanner per shard. For all-partition queries
+    // there is one RemoteScanner per shard. For all-partition queries
     // a RemoteScanner is created for each partition that has at least one
     // result. See the javadoc of PartitionUnionIter in kvstore for a
     // description of how all-partition queries are executed in the 3-tier
     // architecture.
-    sorted_scanners: BTreeSet<RemoteScanner>,
+    sorted_scanners: BinaryHeap<RemoteScanner>,
 }
 
 impl ReceiveIterData {
@@ -120,7 +120,7 @@ impl ReceiveIterData {
         self.total_num_results = 0;
         self.base_vsid = 0;
         self.scanner = RemoteScanner::default();
-        self.sorted_scanners = BTreeSet::default();
+        self.sorted_scanners = BinaryHeap::default();
     }
 }
 
@@ -186,23 +186,33 @@ struct RemoteScanner {
 
 impl Ord for RemoteScanner {
     fn cmp(&self, other: &Self) -> Ordering {
+        // Note all of the values returned are REVERSED due to
+        // BinaryHeap being a max_heap, but we want a min_heap.
+
         if self.has_local_results() == false {
             if other.has_local_results() {
-                return Ordering::Less;
+                return Ordering::Greater;
             }
             if self.shard_or_part_id < other.shard_or_part_id {
-                return Ordering::Less;
+                return Ordering::Greater;
             }
-            return Ordering::Greater;
+            return Ordering::Less;
         }
         if other.has_local_results() == false {
-            return Ordering::Greater;
+            return Ordering::Less;
         }
         let v1 = self.results.front().unwrap();
         let v2 = other.results.front().unwrap();
-        let comp = sort_results(v1, v2, &self.sort_fields, &self.sort_specs);
-        if comp != Ordering::Equal {
-            return comp;
+        let comp = compare_results(v1, v2, &self.sort_fields, &self.sort_specs);
+        debug!(
+            "RI: cmp: ss={:?} v1={:?} v2={:?} result={:?}",
+            self.sort_specs, v1, v2, comp
+        );
+        if comp == Ordering::Greater {
+            return Ordering::Less;
+        }
+        if comp == Ordering::Less {
+            return Ordering::Greater;
         }
         Ordering::Equal
     }
@@ -255,6 +265,7 @@ impl RemoteScanner {
     }
 
     pub fn add_results(&mut self, results: VecDeque<MapValue>, cont_key: Option<Vec<u8>>) {
+        debug!("add_results: cur={:?} new={:?}\n", self.results, results);
         self.results = results;
         self.continuation_key = None;
         if let Some(ck) = cont_key {
@@ -278,24 +289,24 @@ impl RemoteScanner {
         handle: &Handle,
     ) -> Result<Option<MapValue>, NoSQLError> {
         if self.results.len() > 0 {
-            trace!("RemoteScanner.next(): popping front result");
+            debug!("RemoteScanner.next(): popping front result");
             return Ok(self.results.pop_front());
         }
 
         if self.more_remote_results == false || req.reached_limit == true {
-            trace!("RemoteScanner.next(): no more results");
+            debug!("RemoteScanner.next(): no more results");
             return Ok(None);
         }
 
-        trace!("RemoteScanner.next(): fetching more results");
+        debug!("RemoteScanner.next(): fetching more results");
         self.fetch(iter_data, req, handle).await?;
 
         if self.results.len() == 0 {
-            trace!("RemoteScanner.next(): fetch returned no results");
+            debug!("RemoteScanner.next(): fetch returned no results");
             return Ok(None);
         }
 
-        trace!("RemoteScanner.next(): popping first fetched result");
+        debug!("RemoteScanner.next(): popping first fetched result");
         Ok(self.results.pop_front())
     }
 
@@ -322,12 +333,20 @@ impl RemoteScanner {
         //reqCopy.setVirtualScan(theVirtualScan);
         //}
 
-        trace!("\nReceiveIter executing internal request copy:\n");
+        debug!(
+            "\nReceiveIter executing internal request copy (shard={}):\n",
+            req_copy.shard_id
+        );
         let mut vr: Vec<MapValue> = Vec::new();
         req_copy
             .execute_batch_internal(handle, &mut vr, data)
             .await?;
-        trace!("EBI returned {} results : {:?}", vr.len(), vr);
+        debug!(
+            "EBI returned {} results (shard={}): {:?}",
+            vr.len(),
+            req_copy.shard_id,
+            vr
+        );
         self.add_results(VecDeque::from(vr), req_copy.continuation_key);
         req.consumed_capacity.add(&req_copy.consumed_capacity);
 
@@ -386,7 +405,7 @@ impl ReceiveIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let sp = r.read_i32()?; // state_pos
-        trace!("\n . ReceiveIter: result_reg={} state_pos={}\n", rr, sp);
+        debug!("\n . ReceiveIter: result_reg={} state_pos={}\n", rr, sp);
         let mut iter = ReceiveIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -406,7 +425,7 @@ impl ReceiveIter {
     }
 
     pub fn open(&mut self, req: &QueryRequest, _handle: &Handle) -> Result<(), NoSQLError> {
-        trace!("ReceiveIter.open(): current state = {:?}", self.data.state);
+        debug!("ReceiveIter.open(): current state = {:?}", self.data.state);
         if self.data.state == PlanIterState::Open {
             return Ok(());
         }
@@ -419,7 +438,7 @@ impl ReceiveIter {
             }
             let num_shards = ti.shard_ids.len();
             for i in 0..num_shards {
-                self.data.sorted_scanners.insert(RemoteScanner::new(
+                self.data.sorted_scanners.push(RemoteScanner::new(
                     true,
                     ti.shard_ids[i],
                     &self.sort_fields,
@@ -452,7 +471,7 @@ impl ReceiveIter {
         handle: &Handle,
     ) -> Result<bool, NoSQLError> {
         if self.data.state.is_done() {
-            trace!("ReceiveIter.next(): is_done");
+            debug!("ReceiveIter.next(): is_done");
             return Ok(false);
         }
 
@@ -466,10 +485,12 @@ impl ReceiveIter {
         self.sort_fields.len() > 0
     }
     pub fn get_result(&self, req: &mut QueryRequest) -> FieldValue {
-        trace!("ReceiveIter.get_result");
-        req.get_result(self.result_reg)
+        let fv = req.get_result(self.result_reg);
+        debug!("RI{} get_result={:?}", self.result_reg, fv);
+        fv
     }
     pub fn set_result(&self, req: &mut QueryRequest, result: FieldValue) {
+        debug!("RI{} set_result({:?})", self.result_reg, result);
         req.set_result(self.result_reg, result);
     }
     // Default all values, as if this was just created by deserialization
@@ -504,7 +525,7 @@ impl ReceiveIter {
         req: &mut QueryRequest,
         handle: &Handle,
     ) -> Result<bool, NoSQLError> {
-        trace!("ReceiveIter::simple_next()");
+        debug!("ReceiveIter::simple_next()");
         loop {
             let mut scanner = take(&mut self.data.scanner);
             let ret = scanner.next(&mut self.data, req, handle).await?;
@@ -513,11 +534,11 @@ impl ReceiveIter {
                 break;
             }
             let mv = ret.unwrap();
-            trace!("simple_next: mv={:?}", mv);
+            debug!("simple_next: mv={:?}", mv);
             if self.check_duplicate(&mv)? {
                 continue;
             }
-            trace!("ReceiveIter.simple_next(): adding 1 result: {:?}", mv);
+            debug!("ReceiveIter.simple_next(): adding 1 result: {:?}", mv);
             self.set_result(req, FieldValue::Map(mv));
             return Ok(true);
         }
@@ -541,29 +562,33 @@ impl ReceiveIter {
         if self.distribution_kind == DistributionKind::AllPartitions
             && self.data.in_sort_phase_1 == true
         {
-            trace!("ReceiveIter.sorting_next(): calling init_partition_sort");
+            debug!("ReceiveIter.sorting_next(): calling init_partition_sort");
             self.init_partition_sort(req, handle).await?;
             return Ok(false);
         }
 
-        trace!("ReceiveIter::sorting_next()");
+        debug!("ReceiveIter::sorting_next()");
         loop {
-            let sc = self.data.sorted_scanners.pop_first();
+            debug!("  getting next scanner\n");
+            let sc = self.data.sorted_scanners.pop();
             if sc.is_none() {
+                debug!("  no more scanners\n");
                 self.done();
                 return Ok(false);
             }
 
             let mut scanner = sc.unwrap();
+            debug!("  working with scanner({})\n", scanner.shard_or_part_id);
             if let Some(mv) = scanner.next_local() {
                 if scanner.is_done() == false {
-                    self.data.sorted_scanners.insert(scanner);
+                    debug!("  putting scanner({}) back", scanner.shard_or_part_id);
+                    self.data.sorted_scanners.push(scanner);
                 }
                 // TODO mv.convert_empty_to_null()
                 if self.check_duplicate(&mv)? {
                     continue;
                 }
-                trace!("ReceiveIter.sorting_next(): adding 1 result");
+                debug!("ReceiveIter.sorting_next(): adding 1 result: {:?}", mv);
                 self.set_result(req, FieldValue::Map(mv));
                 return Ok(true);
             }
@@ -573,17 +598,21 @@ impl ReceiveIter {
             // (by leaving it outside theSortedScanners) and continue with
             // another scanner.
             if scanner.is_done() {
+                debug!("  scanner({}) is done\n", scanner.shard_or_part_id);
                 continue;
             }
 
             let mut data = take(&mut self.data);
 
-            trace!("ReceiveIter.sorting_next() calling next scanner fetch");
+            debug!(
+                "ReceiveIter.sorting_next() calling scanner({}) fetch",
+                scanner.shard_or_part_id
+            );
             match scanner.fetch(&mut data, req, handle).await {
                 Err(e) => {
                     // TODO: if err is retryable, put back and try again
                     // if err.is_retryable()
-                    // self.data.sorted_scanners.insert(scanner);
+                    // self.data.sorted_scanners.push(scanner);
                     return Err(e);
                 }
                 _ => (),
@@ -594,7 +623,11 @@ impl ReceiveIter {
             // may have more remote results, put the scanner back into
             // theSortedScanner. Otherwise, throw it away.
             if scanner.is_done() == false {
-                self.data.sorted_scanners.insert(scanner);
+                debug!(
+                    "  scanner({}) has more: putting back in",
+                    scanner.shard_or_part_id
+                );
+                self.data.sorted_scanners.push(scanner);
             }
 
             // For simplicity, we don't want to allow the possibility of
@@ -602,7 +635,7 @@ impl ReceiveIter {
             // the batch limit was reached during the above fetch, we set
             // limit flag to true and return false, thus terminating the
             // current batch.
-            trace!("ReceiveIter.sorting_next() setting reached_limit=true");
+            debug!("ReceiveIter.sorting_next() setting reached_limit=true");
             req.reached_limit = true;
             break;
         }
@@ -620,7 +653,7 @@ impl ReceiveIter {
         let mut req_copy = req.copy_for_internal();
         req_copy.continuation_key = self.data.continuation_key.clone();
 
-        trace!("ReceiveIter init_partition_sort executing internal request copy:\n");
+        debug!("ReceiveIter init_partition_sort executing internal request copy:\n");
         let mut vr: Vec<MapValue> = Vec::new();
         req_copy
             .execute_batch_internal(handle, &mut vr, &mut self.data)
@@ -640,7 +673,7 @@ impl ReceiveIter {
             let num_results = self.data.num_results_per_pid[p];
             let cont_key = take(&mut self.data.part_continuation_keys[p]);
 
-            trace!("  pid={} nr={} cont_key={:?}\n", pid, num_results, cont_key);
+            debug!("  pid={} nr={} cont_key={:?}\n", pid, num_results, cont_key);
 
             if num_results <= 0 {
                 return ia_err!("expected at least one result for partition");
@@ -668,8 +701,8 @@ impl ReceiveIter {
             );
 
             scanner.add_results(part_results, Some(cont_key));
-            trace!("created new scanner: {:?}", scanner);
-            self.data.sorted_scanners.insert(scanner);
+            debug!("created new scanner: {:?}", scanner);
+            self.data.sorted_scanners.push(scanner);
         }
 
         // For simplicity, if the size limit was not reached during this
@@ -677,7 +710,7 @@ impl ReceiveIter {
         // app do it. Furthermore, this means that each remote fetch will
         // be done with the max amount of read limit, which will reduce the
         // total number of fetches.
-        trace!("ReceiveIter.init_partition_sort setting reached_limit=true");
+        debug!("ReceiveIter.init_partition_sort setting reached_limit=true");
         req.reached_limit = true;
 
         Ok(())

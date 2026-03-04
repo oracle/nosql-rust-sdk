@@ -541,6 +541,7 @@ pub use crate::table_request::{GetTableRequest, TableRequest, TableResult};
 pub(crate) mod table_usage_request;
 pub use crate::table_usage_request::{TableUsage, TableUsageRequest, TableUsageResult};
 
+pub mod rate_limiter;
 pub mod types;
 /// Type representing a specific version of a table row in the NoSQL Database.
 pub type Version = Vec<u8>;

@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::mem::take;
 use std::result::Result;
-use tracing::{debug, trace};
+use tracing::debug;
 
 #[add_planiter_fields]
 #[derive(Debug, Default, Clone)]
@@ -41,7 +41,7 @@ impl GroupIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let sp = r.read_i32()?; // state_pos
-        trace!("\nGroupIter: result_reg={} state_pos={}\n", rr, sp);
+        debug!("\nGroupIter: result_reg={} state_pos={}\n", rr, sp);
         let mut gi = GroupIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -111,7 +111,8 @@ impl AggrValue {
                 av.value = AggrValueEnum::Field(FieldValue::Long(0));
             }
             FuncCode::FnMin | FuncCode::FnMax => {
-                av.value = AggrValueEnum::Field(FieldValue::Null);
+                // Don't initialize min/max
+                //av.value = AggrValueEnum::Field(FieldValue::Null);
             }
             FuncCode::ArrayCollect => {
                 av.value = AggrValueEnum::Array(Vec::new());
@@ -346,10 +347,12 @@ impl GroupIter {
         PlanIterKind::Group
     }
     pub fn get_result(&self, req: &mut QueryRequest) -> FieldValue {
-        debug!("GroupIter.get_result");
-        req.get_result(self.result_reg)
+        let fv = req.get_result(self.result_reg);
+        debug!("GI{} get_result={:?}", self.result_reg, fv);
+        fv
     }
     pub fn set_result(&self, req: &mut QueryRequest, result: FieldValue) {
+        debug!("GI{} set_result({:?})", self.result_reg, result);
         req.set_result(self.result_reg, result);
     }
     pub fn get_state(&self) -> PlanIterState {
@@ -418,18 +421,17 @@ impl GroupIter {
         handle: &Handle,
     ) -> Result<bool, NoSQLError> {
         if self.data.state == PlanIterState::Done {
-            debug!("GroupIter.next(): already done");
+            debug!("GI{} next(): already done", self.result_reg);
             return Ok(false);
         }
 
         loop {
             if self.data.results_valid {
                 if let Some(tuple) = self.data.results.pop_first() {
-                    trace!("Group_iter popped first result: {:?}", tuple);
-                    trace!(
-                        "Group_iter num_gb_cols={} column_names={:?}",
-                        self.num_gb_columns,
-                        self.column_names
+                    debug!("GI{} popped first result: {:?}", self.result_reg, tuple);
+                    debug!(
+                        "GI{} num_gb_cols={} column_names={:?}",
+                        self.result_reg, self.num_gb_columns, self.column_names
                     );
                     let mut gb_tuple = tuple.0;
                     let mut aggr_tuple = tuple.1;
@@ -454,7 +456,10 @@ impl GroupIter {
                         // ooops - already removed!
                         //self.data.results.remove(gb_tuple);
                     } else {
-                        trace!("NOTE: Removed produced result when told not to...");
+                        debug!(
+                            "GI{} NOTE: Removed produced result when told not to...",
+                            self.result_reg
+                        );
                         // TODO: re-insert the tuple?
                     }
 
@@ -503,12 +508,15 @@ impl GroupIter {
             }
 
             debug!(
-                "Looking for gb_tuple={:?} in results...",
-                self.data.gb_tuple
+                "GI{} Looking for gb_tuple={:?} in results...",
+                self.result_reg, self.data.gb_tuple
             );
             let mut results = take(&mut self.data.results);
             if let Some(aggr_tuple) = results.get_mut(&self.data.gb_tuple) {
-                debug!("Got from results, tuple={:?}", aggr_tuple);
+                debug!(
+                    "GI{} Got from results, tuple={:?}",
+                    self.result_reg, aggr_tuple
+                );
                 for i in self.num_gb_columns..self.column_names.len() {
                     self.aggregate(
                         req,
@@ -521,7 +529,10 @@ impl GroupIter {
                 //rcb.trace("Updated existing group:\n" +
                 //printResult(state.theGBTuple, aggrTuple));
                 //}
-                debug!("After aggregation: tuple={:?}", aggr_tuple);
+                debug!(
+                    "GI{} After aggregation: tuple={:?}",
+                    self.result_reg, aggr_tuple
+                );
                 self.data.results = results;
                 continue;
             }
@@ -568,8 +579,8 @@ impl GroupIter {
 
             if self.num_gb_columns == self.column_names.len() {
                 debug!(
-                    "Results: inserting tuple {:?} with value {:?}",
-                    gb_tuple, aggr_tuple
+                    "GI{} Results: inserting tuple {:?} with value {:?}",
+                    self.result_reg, gb_tuple, aggr_tuple
                 );
                 results.insert(gb_tuple.clone_internal(), aggr_tuple);
                 self.data.results = results;
@@ -582,8 +593,8 @@ impl GroupIter {
             }
 
             debug!(
-                "Results_1: inserting tuple {:?} with value {:?}",
-                gb_tuple, aggr_tuple
+                "GI{} Results_1: inserting tuple {:?} with value {:?}",
+                self.result_reg, gb_tuple, aggr_tuple
             );
             results.insert(gb_tuple, aggr_tuple);
             self.data.results = results;
@@ -615,6 +626,11 @@ impl GroupIter {
         let aggr_kind = aggr_values[offset].func;
         let val_type = val.get_type();
 
+        debug!(
+            "GI{} aggregate: column={column} kind={:?} val={:?}",
+            self.result_reg, aggr_kind, val
+        );
+
         match aggr_kind {
             FuncCode::FnCount => {
                 if val.is_null() {
@@ -644,12 +660,7 @@ impl GroupIter {
             }
             FuncCode::FnMin | FuncCode::FnMax => {
                 match val_type {
-                    FieldType::Binary
-                    | FieldType::Array
-                    | FieldType::Map
-                    | FieldType::Empty
-                    | FieldType::Null
-                    | FieldType::JsonNull => {
+                    FieldType::Binary | FieldType::Array | FieldType::Map | FieldType::Empty => {
                         return Ok(());
                     }
                     _ => (),
@@ -661,12 +672,13 @@ impl GroupIter {
                     //if (theCountMemory) {
                     //rcb.incMemoryConsumption(val.sizeof() - minmaxValue.sizeof());
                     //}
+                    debug!("GI{} setting {:?}={:?}", self.result_reg, aggr_kind, val);
                     aggr_values[offset].value = AggrValueEnum::Field(val);
                     return Ok(());
                 }
                 let cmp: Ordering;
                 if let AggrValueEnum::Field(aval) = &aggr_values[offset].value {
-                    cmp = compare_atomics_total_order(aval, &val, false);
+                    cmp = compare_atomics_total_order(&val, aval, false);
                 } else {
                     return ia_err!("can't do MIN/MAX: existing value not a Field");
                 }
@@ -675,11 +687,11 @@ impl GroupIter {
                 //val + "\ncomp res = " + cmp);
                 //}
                 if aggr_kind == FuncCode::FnMin {
-                    if cmp != Ordering::Greater {
+                    if cmp != Ordering::Less {
                         return Ok(());
                     }
                 } else {
-                    if cmp != Ordering::Less {
+                    if cmp != Ordering::Greater {
                         return Ok(());
                     }
                 }
@@ -690,6 +702,7 @@ impl GroupIter {
                 //val.getType() != minmaxValue.getType()) {
                 //rcb.incMemoryConsumption(val.sizeof() - minmaxValue.sizeof());
                 //}
+                debug!("GI{} setting {:?}={:?}", self.result_reg, aggr_kind, val);
                 aggr_values[offset].value = AggrValueEnum::Field(val);
             }
             FuncCode::ArrayCollect | FuncCode::ArrayCollectDistinct => {

@@ -11,11 +11,11 @@ use crate::plan_iter::{deserialize_plan_iter, PlanIter};
 use crate::plan_iter::{Location, PlanIterKind, PlanIterState};
 use crate::query_request::QueryRequest;
 use crate::reader::Reader;
-use crate::types::{sort_results, FieldValue, MapValue};
+use crate::types::{compare_results, FieldValue, MapValue};
 use oracle_nosql_rust_sdk_derive::add_planiter_fields;
 
 use std::result::Result;
-use tracing::trace;
+use tracing::debug;
 
 // SortSpec specifies criterias for sorting the values.
 //
@@ -96,7 +96,7 @@ impl SortIter {
         // state_pos is now ignored, in the rust driver implementation
         let rr = r.read_i32()?; // result_reg
         let sp = r.read_i32()?; // state_pos
-        trace!("\nSortIter: result_reg={} state_pos={}\n", rr, sp);
+        debug!("\nSortIter: result_reg={} state_pos={}\n", rr, sp);
         let mut s = SortIter {
             // fields common to all PlanIters
             result_reg: rr,
@@ -166,12 +166,12 @@ impl SortIter {
                 return Ok(false);
             }
 
-            //println!("Calling sort: results={:?}", self.data.results);
+            debug!("Calling sort: results={:?}", self.data.results);
             // TODO: sorting of MapValue vectors
-            self.data
-                .results
-                .sort_unstable_by(|a, b| sort_results(a, b, &self.sort_fields, &self.sort_specs));
-            //println!("After sort: results={:?}", self.data.results);
+            self.data.results.sort_unstable_by(|a, b| {
+                compare_results(a, b, &self.sort_fields, &self.sort_specs)
+            });
+            debug!("After sort: results={:?}", self.data.results);
 
             // TODO: all state settings should do state.set_state(foo)
             self.data.state = PlanIterState::Running;
@@ -190,10 +190,12 @@ impl SortIter {
     }
 
     pub fn get_result(&self, req: &mut QueryRequest) -> FieldValue {
-        //println!("SortIter.get_result");
-        req.get_result(self.result_reg)
+        let fv = req.get_result(self.result_reg);
+        debug!("SI{} get_result={:?}", self.result_reg, fv);
+        fv
     }
     pub fn set_result(&self, req: &mut QueryRequest, result: FieldValue) {
+        debug!("SI{} set_result({:?})", self.result_reg, result);
         req.set_result(self.result_reg, result);
     }
     pub fn reset(&mut self) -> Result<(), NoSQLError> {
