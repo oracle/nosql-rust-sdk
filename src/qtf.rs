@@ -94,6 +94,9 @@ pub struct TestSuite {
 
     // dependencies specifies the dependency test suites.
     pub dependencies: Vec<TestSuite>,
+
+    // for verbose logging
+    pub verbose: bool,
 }
 
 pub fn get_subdirs(path: &str, dirs: bool) -> Result<Vec<String>, Box<dyn Error>> {
@@ -341,6 +344,13 @@ impl TestRunner {
         return false;
     }
 
+    fn get_verbose() -> bool {
+        std::env::var("QTF_VERBOSE")
+            .ok()
+            .and_then(|s| s.parse::<bool>().ok())
+            .unwrap_or(false)
+    }
+
     // get_test_suite parses test configurations for the specified test suite, which
     // contains all required information such as the ddl statements to execute
     // before and after tests, the initial data to insert into tables, etc.
@@ -353,6 +363,7 @@ impl TestRunner {
             name: name.to_string(),
             dir: ts_dir,
             included_test_cases: self.included_tests.clone(),
+            verbose: Self::get_verbose(),
             //test_case_dir: tc_dir,
             ..Default::default()
         };
@@ -836,7 +847,9 @@ pub fn parse_excluded_tests(
 
     let mut excluded_tests: HashMap<String, HashMap<String, bool>> = HashMap::new();
     for x in lines {
-        if x.starts_with('#') { continue };
+        if x.starts_with('#') {
+            continue;
+        };
         let sub_strs = ssplit(&x, "/");
         let testsuite = sub_strs[0].clone();
         let testcase: String;

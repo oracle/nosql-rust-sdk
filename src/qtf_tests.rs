@@ -23,10 +23,29 @@ use std::error::Error;
 use std::time::Duration;
 
 #[derive(Debug, Default)]
+struct TestFailure {
+    suite_name: String,
+    test_name: String,
+    error: String,
+}
+
+#[derive(Debug, Default)]
 struct SuiteResults {
     passed: i32,
     failed: i32,
     skipped: i32,
+    failures: Vec<TestFailure>,
+}
+
+impl SuiteResults {
+    fn add_failure_info(&mut self, suite: &str, test: &str, err: String) {
+        let f = TestFailure {
+            suite_name: suite.to_string(),
+            test_name: test.to_string(),
+            error: err,
+        };
+        self.failures.push(f);
+    }
 }
 
 async fn get_handle() -> Result<Handle, NoSQLError> {
@@ -57,7 +76,7 @@ async fn qtf_test() -> Result<(), Box<dyn Error>> {
         return Err("please set QTF_ROOT_DIR to the resources/cases directory".into());
     }
 
-    let runner = TestRunner::new(&qtf_root_dir)?;
+    let mut runner = TestRunner::new(&qtf_root_dir)?;
     let mut totals = SuiteResults::default();
 
     const DEFAULT_RATE_LIMIT: f64 = 3.0;
@@ -67,56 +86,94 @@ async fn qtf_test() -> Result<(), Box<dyn Error>> {
         .unwrap_or(DEFAULT_RATE_LIMIT);
     let mut rl = RateLimiter::new(ddl_rate_limit);
 
-    for name in &runner.dir_names {
-        if runner.is_excluded_test_suite(name) {
-            // The entire test suite is excluded.
-            // Create an instance of the test suite, do not read test configurations.
-            totals.skipped += runner.get_num_tests(name);
-            //println!("Skipping test suite {}", name);
-            continue;
-        }
-        // Read configurations for the test suite.
-        let ts_opt = runner.get_test_suite(name);
-        if let Err(e) = ts_opt {
-            println!("FAIL: get_test_suite({name}) got error: {e}");
-            totals.failed += runner.get_num_tests(name);
-            continue;
-        }
-        let mut ts = ts_opt.unwrap();
-
-        // Some test suites such as "identity" has a corresponding sub directory in
-        // QTFRootDir, but all properties in test.config are commented out.
-        // Skip such test suites.
-        if ts.test_case_dir == "" || ts.test_result_dir == "" {
-            println!("Skipping directory {name} as it does not represent a test suite");
-            totals.skipped += runner.get_num_tests(name);
-            continue;
-        }
-
-        if let Some(m) = runner.excluded_tests.get(name) {
-            ts.excluded_test_cases = m.clone();
-        }
-
-        match run_test_suite(&mut ts, &handle, &mut rl).await {
-            Ok(r) => {
-                println!("Suite {}: {:?}", name, r);
-                totals.passed += r.passed;
-                totals.failed += r.failed;
-                totals.skipped += r.skipped;
+    let max_retries = std::env::var("QTF_MAX_RETRIES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1);
+    for retry in 0..max_retries {
+        for name in &runner.dir_names {
+            if runner.is_excluded_test_suite(name) {
+                // The entire test suite is excluded.
+                // Create an instance of the test suite, do not read test configurations.
+                totals.skipped += runner.get_num_tests(name);
+                //println!("Skipping test suite {}", name);
+                continue;
             }
-            Err(e) => {
-                println!("FAIL: Test suite {name} failed: {}", e);
+            // Read configurations for the test suite.
+            let ts_opt = runner.get_test_suite(name);
+            if let Err(e) = ts_opt {
+                println!("FAIL: get_test_suite({name}) got error: {e}");
                 totals.failed += runner.get_num_tests(name);
-                let _ = tear_down_test_suite(&mut ts, &handle, &mut rl).await;
+                totals.add_failure_info(name, "", format!("{e}"));
+                continue;
+            }
+            let mut ts = ts_opt.unwrap();
+
+            // Some test suites such as "identity" has a corresponding sub directory in
+            // QTFRootDir, but all properties in test.config are commented out.
+            // Skip such test suites.
+            if ts.test_case_dir == "" || ts.test_result_dir == "" {
+                println!("Skipping directory {name} as it does not represent a test suite");
+                totals.skipped += runner.get_num_tests(name);
+                continue;
+            }
+
+            if let Some(m) = runner.excluded_tests.get(name) {
+                ts.excluded_test_cases = m.clone();
+            }
+
+            match run_test_suite(&mut ts, &handle, &mut rl).await {
+                Ok(r) => {
+                    println!(
+                        "Suite {}: passed={} failed={} skipped={}",
+                        name, r.passed, r.failed, r.skipped
+                    );
+                    totals.passed += r.passed;
+                    totals.failed += r.failed;
+                    totals.skipped += r.skipped;
+                    totals.failures.extend(r.failures);
+                }
+                Err(e) => {
+                    println!("FAIL: Test suite {name} failed: {}", e);
+                    totals.failed += runner.get_num_tests(name);
+                    totals.add_failure_info(name, "", format!("{e}"));
+                    let _ = tear_down_test_suite(&mut ts, &handle, &mut rl).await;
+                }
             }
         }
+        for f in &totals.failures {
+            println!(" FAIL: {} {} {}", f.suite_name, f.test_name, f.error);
+        }
+        println!(
+            "\n\nTotal test suites={}. Test cases: passed={} failed={} skipped={}",
+            runner.dir_names.len(),
+            totals.passed,
+            totals.failed,
+            totals.skipped
+        );
+        if totals.failures.is_empty() {
+            break;
+        }
+        if retry >= (max_retries - 1) {
+            if max_retries > 1 {
+                println!("Above failures persisted after {retry} retries");
+            }
+            break;
+        }
+        // only retry failed suites
+        runner = TestRunner::new(&qtf_root_dir)?;
+        runner.included_suites.clear();
+        for f in &totals.failures {
+            runner
+                .included_suites
+                .insert(f.suite_name.to_string(), true);
+        }
+        totals = SuiteResults::default();
+    } // retry loop
+
+    if totals.failed > 0 {
+        return Err(format!("{} test cases failed", totals.failed).into());
     }
-    println!(
-        "Total test suites: {}, {:?}",
-        runner.dir_names.len(),
-        totals
-    );
-    // TODO: Err if failed > 0
     Ok(())
 }
 
@@ -128,16 +185,20 @@ async fn run_test_suite(
     let mut tr = SuiteResults::default();
     let tc_names = ts.get_test_case_names()?;
     if ts.excluded_test_cases.get("*").is_some() {
-        println!("skip test suite {} as it is not applicable", ts.name);
+        if ts.verbose {
+            println!("skip test suite {} as it is not applicable", ts.name);
+        }
         tr.skipped += tc_names.len() as i32;
         return Ok(tr);
     }
 
-    println!(
-        "total number of testcases in suite {} is {}",
-        ts.name,
-        tc_names.len()
-    );
+    if ts.verbose {
+        println!(
+            "total number of testcases in suite {} is {}",
+            ts.name,
+            tc_names.len()
+        );
+    }
 
     for tc_name in tc_names {
         if ts.is_excluded_test_case(&tc_name) {
@@ -187,16 +248,20 @@ async fn set_up_test_suite(
         .unwrap_or(500);
     let limits = TableLimits::provisioned(units, units, 3);
 
-    if ts.before_ddls.len() > 0 {
+    if ts.before_ddls.len() > 0 && ts.verbose {
         println!("Executing suite {} DDLs on setup:", ts.name);
     }
 
     // TODO: if total units for table creation exceeds max, set limit for each to 1/Nth
 
     for stmt in &ts.before_ddls {
-        let now = std::time::SystemTime::now();
-        let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH).expect("Time went backwards");
-        println!("  {} {}", duration_since_epoch.as_secs(), stmt);
+        if ts.verbose {
+            let now = std::time::SystemTime::now();
+            let duration_since_epoch = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("Time went backwards");
+            println!("  {} {}", duration_since_epoch.as_secs(), stmt);
+        }
         let substrs = snsplit(10, stmt, " ");
         if substrs.len() < 2 {
             continue;
@@ -229,9 +294,12 @@ async fn set_up_test_suite(
     }
 
     for (table, rows) in &ts.before_data {
-        println!("Inserting {} rows into table '{}'", rows.len(), table);
+        if ts.verbose {
+            println!("Inserting {} rows into table '{}'", rows.len(), table);
+        }
         for mv in rows {
             //println!("row={:?}", mv);
+            //TODO: timeout from env
             let pres = PutRequest::new(&table)
                 .value(mv.clone_internal())
                 .execute(handle)
@@ -279,14 +347,18 @@ async fn clean_up(
         clean_up(dep, handle, rl).await?;
     }
 
-    if ts.after_ddls.len() > 0 {
+    if ts.after_ddls.len() > 0 && ts.verbose {
         println!("Executing {} DDLs to clean up:", ts.after_ddls.len());
     }
 
     for stmt in &ts.after_ddls {
-        let now = std::time::SystemTime::now();
-        let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH).expect("Time went backwards");
-        println!("  {} {}", duration_since_epoch.as_secs(), stmt);
+        if ts.verbose {
+            let now = std::time::SystemTime::now();
+            let duration_since_epoch = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("Time went backwards");
+            println!("  {} {}", duration_since_epoch.as_secs(), stmt);
+        }
         let substrs = snsplit(3, stmt, " ");
         if substrs.len() < 2 {
             continue;
@@ -343,22 +415,30 @@ async fn run_test_case(
     handle: &Handle,
 ) {
     let display_name = format!("{}/{}", ts.name, tc.name);
-    println!("\n TEST CASE: {}\n", display_name);
+    if ts.verbose {
+        println!("\n TEST CASE: {}\n", display_name);
+    }
     if ts.excluded_test_cases.contains_key(&tc.name) {
         // This test case is not applicable.
-        println!("skip test case {display_name} as it is not applicable");
+        if ts.verbose {
+            println!("skip test case {display_name} as it is not applicable");
+        }
         tr.skipped += 1;
         return;
     }
 
     if tc.query_stmts.len() == 0 {
-        println!("no query statements found for test case {display_name}");
+        if ts.verbose {
+            println!("no query statements found for test case {display_name}");
+        }
         tr.skipped += 1;
         return;
     }
 
     let mut stmt = tc.query_stmts.clone();
-    println!("stmt={}", stmt);
+    if ts.verbose {
+        println!("stmt={}", stmt);
+    }
 
     // Check if the test case contains multiple query statements.
     // A QTF test case may contain one of the INSERT/DELETE/UPDATE statements
@@ -437,6 +517,15 @@ async fn run_test_case(
             println!("   expected: {:?}", tc.expect_results);
             println!("   actual  : {:?}", actual_results);
             tr.failed += 1;
+            tr.add_failure_info(
+                &ts.name,
+                &tc.name,
+                format!(
+                    "unexpected number of results: expected={} actual={}",
+                    tc.expect_results.len(),
+                    actual_results.len()
+                ),
+            );
             return;
         }
         let mut num_not_match: i32 = 0;
@@ -459,6 +548,11 @@ async fn run_test_case(
         if num_not_match > 0 {
             println!("FAIL: {display_name}: {num_not_match} rows do not match");
             tr.failed += 1;
+            tr.add_failure_info(
+                &ts.name,
+                &tc.name,
+                format!("{num_not_match} rows do not match"),
+            );
             return;
         }
 
@@ -515,6 +609,15 @@ async fn run_test_case(
         actual_results.len()
     );
     tr.failed += 1;
+    tr.add_failure_info(
+        &ts.name,
+        &tc.name,
+        format!(
+            "mismatch in unordered results: expected={} actual={}",
+            expected_results.len(),
+            actual_results.len()
+        ),
+    );
     for i in &expected_results {
         if i.len() > 0 {
             println!(" expected: {:?}", i);
@@ -545,6 +648,11 @@ async fn do_query_test(
             Ok(_) => {
                 println!("FAIL: {} should have failed to compile", msg_prefix);
                 tr.failed += 1;
+                tr.add_failure_info(
+                    &ts.name,
+                    &tc.name,
+                    format!("query should have failed to compile"),
+                );
             }
             Err(_e) => {
                 //println!("Prepare({}) got expected compile error: {}", stmt, e);
@@ -563,6 +671,12 @@ async fn do_query_test(
         }
         println!("FAIL: {} prepare() got unexpected error {}", msg_prefix, e);
         tr.failed += 1;
+        tr.add_failure_info(
+            &ts.name,
+            &tc.name,
+            format!("prepare() got unexpected error {}", e),
+        );
+
         return None;
     }
 
@@ -573,9 +687,15 @@ async fn do_query_test(
             msg_prefix
         );
         tr.failed += 1;
+        tr.add_failure_info(
+            &ts.name,
+            &tc.name,
+            format!("prepare() did not return a prepared statement"),
+        );
         return None;
     }
 
+    //TODO: timeout from env
     let mut query_req = QueryRequest::new_prepared(&ps).consistency(cons);
 
     let mut vars = get_external_vars(stmt);
@@ -603,6 +723,11 @@ async fn do_query_test(
                 ts.name, tc.name, stmt, e
             );
             tr.failed += 1;
+            tr.add_failure_info(
+                &ts.name,
+                &tc.name,
+                format!("query got unexpected error {e}"),
+            );
             return None;
         }
 
@@ -628,6 +753,15 @@ async fn do_query_test(
             tc.expect_err_messages
         );
         tr.failed += 1;
+        tr.add_failure_info(
+            &ts.name,
+            &tc.name,
+            format!(
+                "query should have failed with an error \
+                    that contains one of the messages: {:?}",
+                tc.expect_err_messages
+            ),
+        );
         return None;
     }
 
@@ -680,6 +814,7 @@ async fn create_table(
 ) -> Result<(), Box<dyn Error>> {
     rl.consume_units_with_timeout(1, 60000, true).await?;
 
+    //TODO: timeout from environment
     TableRequest::new("")
         .statement(stmt)
         .limits(limits)
@@ -697,6 +832,7 @@ async fn execute_ddl(
     rl: &mut RateLimiter,
 ) -> Result<(), Box<dyn Error>> {
     rl.consume_units_with_timeout(1, 60000, true).await?;
+    //TODO: timeout from environment
     SystemRequest::new(stmt)
         .execute(handle)
         .await?
@@ -712,6 +848,7 @@ async fn execute_table_ddl(
     rl: &mut RateLimiter,
 ) -> Result<(), Box<dyn Error>> {
     rl.consume_units_with_timeout(1, 60000, true).await?;
+    //TODO: timeout from environment
     TableRequest::new("")
         .statement(stmt)
         .execute(handle)
