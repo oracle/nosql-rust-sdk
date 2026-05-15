@@ -836,7 +836,9 @@ pub fn parse_excluded_tests(
 
     let mut excluded_tests: HashMap<String, HashMap<String, bool>> = HashMap::new();
     for x in lines {
-        if x.starts_with('#') { continue };
+        if x.starts_with('#') {
+            continue;
+        };
         let sub_strs = ssplit(&x, "/");
         let testsuite = sub_strs[0].clone();
         let testcase: String;

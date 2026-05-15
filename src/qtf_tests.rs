@@ -195,7 +195,9 @@ async fn set_up_test_suite(
 
     for stmt in &ts.before_ddls {
         let now = std::time::SystemTime::now();
-        let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH).expect("Time went backwards");
+        let duration_since_epoch = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards");
         println!("  {} {}", duration_since_epoch.as_secs(), stmt);
         let substrs = snsplit(10, stmt, " ");
         if substrs.len() < 2 {
@@ -285,7 +287,9 @@ async fn clean_up(
 
     for stmt in &ts.after_ddls {
         let now = std::time::SystemTime::now();
-        let duration_since_epoch = now.duration_since(std::time::UNIX_EPOCH).expect("Time went backwards");
+        let duration_since_epoch = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards");
         println!("  {} {}", duration_since_epoch.as_secs(), stmt);
         let substrs = snsplit(3, stmt, " ");
         if substrs.len() < 2 {

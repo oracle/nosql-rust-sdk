@@ -80,8 +80,6 @@ macro_rules! ia_error {
     }};
 }
 
-pub(crate) use ia_error;
-
 macro_rules! ia_err {
     ($($t:tt)*) => {{
         let m = format!($($t)*);

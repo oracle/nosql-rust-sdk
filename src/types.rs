@@ -773,7 +773,7 @@ impl MapValue {
         self.m.len()
     }
 
-    pub fn iter(&self) -> Iter<String, FieldValue> {
+    pub fn iter(&self) -> Iter<'_, String, FieldValue> {
         self.m.iter()
     }
 
@@ -1266,7 +1266,7 @@ impl Default for TopologyInfo {
     fn default() -> Self {
         Self {
             seq_num: -1,
-            shard_ids: Vec::default()
+            shard_ids: Vec::default(),
         }
     }
 }

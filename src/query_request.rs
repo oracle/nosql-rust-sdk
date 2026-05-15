@@ -205,8 +205,8 @@ impl QueryRequest {
         } else {
             ti = TopologyInfo::default();
             //panic!(
-                //"Invalid prepared statement passed to new_prepared! Missing toploogy info. ps={:?}",
-                //prepared_statement
+            //"Invalid prepared statement passed to new_prepared! Missing toploogy info. ps={:?}",
+            //prepared_statement
             //);
         }
         QueryRequest {

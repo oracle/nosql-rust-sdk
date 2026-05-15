@@ -297,6 +297,12 @@ impl Reader {
         let _num_bytes = self.read_i32()?;
         // number of items in the array
         let num_items = self.read_i32()?;
+        if num_items < 0 || (num_items as usize) > self.buf.len() {
+            return Err(NoSQLError::new(
+                BadProtocolMessage,
+                "invalid num_items in array message",
+            ));
+        }
         // walk items
         //println!("read_array: num_items={}", num_items);
         let mut arr = Vec::<FieldValue>::with_capacity(num_items as usize);
@@ -320,7 +326,14 @@ impl Reader {
         if len <= 0 {
             return Ok(Vec::new());
         }
-        let mut arr: Vec<String> = Vec::with_capacity(len as usize);
+        let ulen = len as usize;
+        if ulen > self.buf.len() {
+            return Err(NoSQLError::new(
+                BadProtocolMessage,
+                "invalid length in string array message",
+            ));
+        }
+        let mut arr: Vec<String> = Vec::with_capacity(ulen);
         for _i in 0..len {
             arr.push(self.read_string()?);
         }
@@ -338,8 +351,15 @@ impl Reader {
         if len <= 0 {
             return Ok(Vec::new());
         }
-        //println!("read_i32_array: len={}", len);
-        let mut arr: Vec<i32> = Vec::with_capacity(len as usize);
+        let ulen = len as usize;
+        if ulen > self.buf.len() {
+            return Err(NoSQLError::new(
+                BadProtocolMessage,
+                "invalid length in i32 array message",
+            ));
+        }
+        //println!("read_i32_array: len={}", ulen);
+        let mut arr: Vec<i32> = Vec::with_capacity(ulen);
         for _i in 0..len {
             arr.push(self.read_packed_i32()?);
         }
