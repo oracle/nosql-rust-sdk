@@ -192,7 +192,7 @@ pub struct NsonSerializer<'a> {
 // the end* calls but again, that relies on the caller.
 
 impl<'a> NsonSerializer<'a> {
-    pub fn new(writer: &'a mut Writer) -> NsonSerializer {
+    pub fn new(writer: &'a mut Writer) -> NsonSerializer<'a> {
         NsonSerializer {
             writer: writer,
             offset_stack: Vec::new(),
@@ -383,7 +383,7 @@ impl<'a> NsonSerializer<'a> {
         self.end_map(PAYLOAD);
     }
 
-    pub fn start_request(writer: &'a mut Writer) -> NsonSerializer {
+    pub fn start_request(writer: &'a mut Writer) -> NsonSerializer<'a> {
         let mut ns = NsonSerializer::new(writer);
         ns.start_map("");
         ns
@@ -405,12 +405,11 @@ pub struct MapWalker<'a> {
 const MAX_ELEMENTS: i32 = 100000000;
 
 impl<'a> MapWalker<'a> {
-    pub fn new(r: &'a mut Reader) -> Result<MapWalker, NoSQLError> {
+    pub fn new(r: &'a mut Reader) -> Result<MapWalker<'a>, NoSQLError> {
         Self::expect_type(r, FieldType::Map)?;
         let _ = r.read_i32()?; // skip map size in bytes
         let num_elements = r.read_i32()?;
         if num_elements < 0 || num_elements > MAX_ELEMENTS {
-            // TODO NoSQL error type
             return Err(NoSQLError::new(
                 BadProtocolMessage,
                 "invalid num_elements in message",
@@ -489,6 +488,12 @@ impl<'a> MapWalker<'a> {
         Self::expect_type(self.r, FieldType::Array)?;
         let _ = self.r.read_i32()?; // skip array size in bytes
         let num_elements = self.r.read_i32()?;
+        if num_elements < 0 || (num_elements as usize) > self.r.buf.len() {
+            return Err(NoSQLError::new(
+                BadProtocolMessage,
+                "invalid num_elements in string array",
+            ));
+        }
         let mut v: Vec<String> = Vec::with_capacity(num_elements as usize);
         for _n in 1..=num_elements {
             v.push(self.read_nson_string()?);
@@ -501,6 +506,12 @@ impl<'a> MapWalker<'a> {
         Self::expect_type(self.r, FieldType::Array)?;
         let _ = self.r.read_i32()?; // skip array size in bytes
         let num_elements = self.r.read_i32()?;
+        if num_elements < 0 || (num_elements as usize) > self.r.buf.len() {
+            return Err(NoSQLError::new(
+                BadProtocolMessage,
+                "invalid num_elements in i32 array",
+            ));
+        }
         let mut v: Vec<i32> = Vec::with_capacity(num_elements as usize);
         for _n in 1..=num_elements {
             v.push(self.read_nson_i32()?);

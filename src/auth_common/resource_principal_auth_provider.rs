@@ -195,7 +195,19 @@ impl ResourcePrincipalAuthProvider {
                 .into());
         }
         trace!("rpst expiration={}", exp);
-        trace!("using RPST token: {}", token);
+        let token_last_4: String = token
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        trace!(
+            "using RPST token: len={}, last4={}",
+            token.chars().count(),
+            token_last_4
+        );
 
         Ok(ResourcePrincipalAuthProvider {
             token: format!("ST${}", token),

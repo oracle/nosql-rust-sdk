@@ -131,6 +131,12 @@ impl GetIndexesRequest {
                     MapWalker::expect_type(walker.r, FieldType::Array)?;
                     let _ = walker.r.read_i32()?; // skip array size in bytes
                     let num_elements = walker.r.read_i32()?;
+                    if num_elements < 0 || (num_elements as usize) > walker.r.buf.len() {
+                        return Err(NoSQLError::new(
+                            BadProtocolMessage,
+                            "invalid num_elements in index array",
+                        ));
+                    }
                     res.indexes = Vec::with_capacity(num_elements as usize);
                     for _n in 1..=num_elements {
                         res.indexes
@@ -162,6 +168,12 @@ impl GetIndexesRequest {
                     MapWalker::expect_type(walker.r, FieldType::Array)?;
                     let _ = walker.r.read_i32()?; // skip array size in bytes
                     let num_elements = walker.r.read_i32()?;
+                    if num_elements < 0 || (num_elements as usize) > walker.r.buf.len() {
+                        return Err(NoSQLError::new(
+                            BadProtocolMessage,
+                            "invalid num_elements in fields array",
+                        ));
+                    }
                     res.field_names = Vec::with_capacity(num_elements as usize);
                     res.field_types = Vec::with_capacity(num_elements as usize);
                     for _n in 1..=num_elements {
