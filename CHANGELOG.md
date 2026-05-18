@@ -3,6 +3,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/).
 
+## 0.1.3 05/18/2026
+
+### Added
+- Added latest OCI region codes
+
+### Changed
+- Updated copyrights to 2026
+- Enabled QTF tests to run against a cloud instance
+
+### Fixed
+- Fixed compiler warnings, security issues, formatting
+- Fixed prepared queries for 22.4 and lower servers
+- Fixed various QTF tests
+
+
 ## 0.1.2 08/13/2025
 
 ### Added
