@@ -228,12 +228,16 @@ impl MultiDeleteRequest {
             ns.start_map(RANGE);
             ns.write_string_field(RANGE_PATH, &range.field_path);
             if let Some(start) = &range.start {
+                ns.start_map(START);
                 ns.write_field(VALUE, start);
                 ns.write_bool_field(INCLUSIVE, range.start_inclusive);
+                ns.end_map(START);
             }
             if let Some(end) = &range.end {
+                ns.start_map(END);
                 ns.write_field(VALUE, end);
                 ns.write_bool_field(INCLUSIVE, range.end_inclusive);
+                ns.end_map(END);
             }
             ns.end_map(RANGE);
         }

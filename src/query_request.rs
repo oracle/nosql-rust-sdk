@@ -385,6 +385,10 @@ impl QueryRequest {
         }
         QueryRequest {
             is_internal: true,
+            max_read_kb: self.max_read_kb,
+            max_write_kb: self.max_write_kb,
+            consistency: self.consistency,
+            compartment_id: self.compartment_id.clone(),
             prepared_statement: self.prepared_statement.copy_for_internal(),
             shard_id: self.shard_id,
             //limit: self.limit,

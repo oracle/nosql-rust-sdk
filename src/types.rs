@@ -1014,83 +1014,86 @@ pub(crate) enum OpCode {
 
     // DeleteIfVersion is used for the operation that deletes a row from table
     // if the row matches the specified version.
-    DeleteIfVersion, // 1
+    DeleteIfVersion = 1,
 
     // Get is used for the operation that retrieves a row from table.
-    Get, // 2
+    Get = 2,
 
     // Put is used for the operation that unconditionally puts a row to table.
-    Put, // 3
+    Put = 3,
 
     // PutIfAbsent is used for the operation that puts a row to table if the row
     // is absent.
-    PutIfAbsent, // 4
+    PutIfAbsent = 4,
 
     // PutIfPresent is used for the operation that puts a row to table if the row
     // is present.
-    PutIfPresent, // 5
+    PutIfPresent = 5,
 
     // PutIfVersion is used for the operation that puts a row to table if the row
     // matches the specified version.
-    PutIfVersion, // 6
+    PutIfVersion = 6,
 
     // Query is used for the query operation.
     // A query operation can perform select, insert, update and delete operations
     // over an SQL statement.
-    Query, // 7
+    Query = 7,
 
     // Prepare is used for the operation that compiles/prepares an SQL statement
     // before execution.
-    Prepare, // 8
+    Prepare = 8,
 
     // WriteMultiple is used to perform multiple write operations associated
     // with a table in a single transaction.
-    WriteMultiple, // 9
+    WriteMultiple = 9,
 
     // MultiDelete is used for the operation that deletes multiple rows from a
     // table in a single transaction.
-    MultiDelete, // 10
+    MultiDelete = 10,
 
     // GetTable is used for the operation that retrieves static information about a table.
-    GetTable, // 11
+    GetTable = 11,
 
     // GetIndexes is used for the operation that retrieves information about an index.
-    GetIndexes, // 12
+    GetIndexes = 12,
 
     // GetTableUsage is used for the operation that retrieves usage information on a table.
-    GetTableUsage, // 13
+    GetTableUsage = 13,
 
     // ListTables is used for the operation that lists all available table names.
-    ListTables, // 14
+    ListTables = 14,
 
     // TableRequest is used for the operation that manages table schema or
     // changes table limits.
-    TableRequest, // 15
+    TableRequest = 15,
 
     // Scan is reserved for internal use.
-    Scan, // 16
+    Scan = 16,
 
     // IndexScan is reserved for internal use.
-    IndexScan, // 17
+    IndexScan = 17,
 
     // CreateTable represents the operation that creates a table.
-    CreateTable, // 18
+    CreateTable = 18,
 
     // AlterTable represents the operation that modifies the table schema.
-    AlterTable, // 19
+    AlterTable = 19,
 
     // DropTable represents the operation that drops a table.
-    DropTable, // 20
+    DropTable = 20,
 
     // CreateIndex represents the operation that creates an index on a table.
-    CreateIndex, // 21
+    CreateIndex = 21,
+
+    // DropIndex represents the operation that drops an index on a table.
+    DropIndex = 22,
 
     // SystemRequest is used to perform system operations such as
     // administrative operations that do not affect a specific table.
-    SystemRequest, // 23
+    SystemRequest = 23,
 
     // SystemStatusRequest is used to retrieve the operation status of a SystemRequest.
-    SystemStatusRequest, // 24
+    SystemStatusRequest = 24,
 }
 
 // Capacity represents the read/write throughput consumed by an operation.
