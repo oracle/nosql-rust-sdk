@@ -5,6 +5,7 @@
 //  https://oss.oracle.com/licenses/upl/
 //
 use crate::error::NoSQLError;
+use crate::error::NoSQLErrorCode::BadProtocolMessage;
 use crate::handle::Handle;
 use crate::handle::SendOptions;
 use crate::nson::*;
@@ -202,6 +203,12 @@ impl TableUsageRequest {
                     MapWalker::expect_type(walker.r, FieldType::Array)?;
                     let _ = walker.r.read_i32()?; // skip array size in bytes
                     let num_elements = walker.r.read_i32()?;
+                    if num_elements < 0 || (num_elements as usize) > walker.r.buf.len() {
+                        return Err(NoSQLError::new(
+                            BadProtocolMessage,
+                            "invalid num_elements in usage array",
+                        ));
+                    }
                     res.usage_records = Vec::with_capacity(num_elements as usize);
                     for _n in 1..=num_elements {
                         res.usage_records

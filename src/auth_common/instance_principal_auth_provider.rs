@@ -60,7 +60,7 @@ impl InstancePrincipalAuthProvider {
         InstancePrincipalAuthProvider::new_with_client(&reqwest::Client::builder().build()?).await
     }
 
-    #[instrument]
+    #[instrument(skip(client))]
     pub async fn new_with_client(
         client: &reqwest::Client,
     ) -> Result<InstancePrincipalAuthProvider, Box<dyn Error>> {
@@ -234,7 +234,7 @@ fn serialize_jwt(
     return jwt_request_body;
 }
 
-#[instrument]
+#[instrument(skip(client, jwt_request_body, private_key_pair))]
 async fn get_security_token_from_auth_service(
     client: &reqwest::Client,
     host: String,
@@ -274,7 +274,6 @@ async fn get_security_token_from_auth_service(
     }
 
     let rtext = response.text().await?;
-    trace!("response text: {}", rtext);
     let v: Value = serde_json::from_str(&rtext)?;
     let token = format!("{}", v["token"]).replace("\"", "");
     Ok(token)
