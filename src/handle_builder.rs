@@ -10,6 +10,7 @@
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use std::default::Default;
 use std::env;
+use std::fmt;
 use std::result::Result;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,7 +32,7 @@ use crate::region::{file_to_string, string_to_region, Region};
 /// See [Configuring the SDK](index.html#configuring-the-sdk) for a detailed description of creating configurations for
 /// various Oracle NoSQL Database instance types (cloud, on-premises, etc.).
 ///
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Clone)]
 pub struct HandleBuilder {
     pub(crate) endpoint: String,
     pub(crate) timeout: Option<Duration>,
@@ -53,12 +54,40 @@ pub struct HandleBuilder {
     pub(crate) default_compartment_id: String,
 }
 
-#[derive(Default, Debug)]
+impl fmt::Debug for HandleBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandleBuilder")
+            .field("endpoint", &self.endpoint)
+            .field("timeout", &self.timeout)
+            .field("region", &self.region)
+            .field("use_https", &self.use_https)
+            .field("mode", &self.mode)
+            .field("add_cert", &self.add_cert.as_ref().map(|_| "[present]"))
+            .field("client", &self.client.as_ref().map(|_| "[present]"))
+            .field("accept_invalid_certs", &self.accept_invalid_certs)
+            .field("auth_type", &self.auth_type)
+            .field("auth", &"[redacted]")
+            .field("in_test", &self.in_test)
+            .field("from_environment", &self.from_environment)
+            .field("default_compartment_id", &self.default_compartment_id)
+            .finish()
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct AuthConfig {
     pub(crate) provider: AuthProvider,
 }
 
-#[derive(Default, Debug)]
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("provider", &self.provider)
+            .finish()
+    }
+}
+
+#[derive(Default)]
 pub(crate) enum AuthProvider {
     File {
         //path: String,
@@ -83,6 +112,34 @@ pub(crate) enum AuthProvider {
     },
     #[default]
     None,
+}
+
+impl fmt::Debug for AuthProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuthProvider::File { .. } => f
+                .debug_struct("File")
+                .field("provider", &"[redacted]")
+                .finish(),
+            AuthProvider::Instance { .. } => f
+                .debug_struct("Instance")
+                .field("provider", &"[redacted]")
+                .finish(),
+            AuthProvider::Resource { .. } => f
+                .debug_struct("Resource")
+                .field("provider", &"[redacted]")
+                .finish(),
+            AuthProvider::External { .. } => f
+                .debug_struct("External")
+                .field("provider", &"[redacted]")
+                .finish(),
+            AuthProvider::Onprem { provider } => f
+                .debug_struct("Onprem")
+                .field("provider", &provider.as_ref().map(|_| "[redacted]"))
+                .finish(),
+            AuthProvider::None => f.write_str("None"),
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -528,12 +585,20 @@ impl HandleBuilder {
 }
 
 // On premises auth
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Clone)]
 pub(crate) struct OnpremAuthProvider {
     pub(crate) inner: Arc<OnpremAuthProviderRef>,
 }
 
-#[derive(Default, Debug)]
+impl fmt::Debug for OnpremAuthProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnpremAuthProvider")
+            .field("inner", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct OnpremAuthProviderRef {
     username: String,
     password: String,
@@ -542,11 +607,31 @@ pub(crate) struct OnpremAuthProviderRef {
     token: tokio::sync::Mutex<OnpremToken>,
 }
 
-#[derive(Default, Debug, Deserialize)]
+impl fmt::Debug for OnpremAuthProviderRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnpremAuthProviderRef")
+            .field("username", &"[redacted]")
+            .field("password", &"[redacted]")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Default, Deserialize)]
 struct OnpremToken {
     token: String,
     #[serde(rename = "expireAt")]
     expire_at: i64,
+}
+
+impl fmt::Debug for OnpremToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OnpremToken")
+            .field("token", &"[redacted]")
+            .field("expire_at", &self.expire_at)
+            .finish()
+    }
 }
 
 impl OnpremAuthProvider {
@@ -621,5 +706,60 @@ impl OnpremAuthProvider {
             .as_millis();
         let imillis: i64 = umillis.try_into().unwrap();
         imillis
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn onprem_debug_redacts_credentials_and_token() {
+        let auth_ref = OnpremAuthProviderRef {
+            username: "secret-user".to_string(),
+            password: "secret-password".to_string(),
+            endpoint: "https://example.com/V2/nosql/security".to_string(),
+            token: tokio::sync::Mutex::new(OnpremToken {
+                token: "secret-token".to_string(),
+                expire_at: 123,
+            }),
+        };
+
+        let debug = format!("{:?}", auth_ref);
+
+        assert!(!debug.contains("secret-user"));
+        assert!(!debug.contains("secret-password"));
+        assert!(!debug.contains("secret-token"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn builder_and_auth_config_debug_do_not_format_auth_provider_internals() {
+        let mut builder = HandleBuilder::new();
+        builder.endpoint = "example.com".to_string();
+        builder.auth_type = AuthType::Onprem;
+        let provider = OnpremAuthProvider::new(&builder, "secret-user", "secret-password");
+        builder.auth = Arc::new(tokio::sync::Mutex::new(AuthConfig {
+            provider: AuthProvider::Onprem {
+                provider: Some(provider.clone()),
+            },
+        }));
+
+        let builder_debug = format!("{:?}", builder);
+        let auth_debug = format!(
+            "{:?}",
+            AuthConfig {
+                provider: AuthProvider::Onprem {
+                    provider: Some(provider),
+                },
+            }
+        );
+
+        assert!(!builder_debug.contains("secret-user"));
+        assert!(!builder_debug.contains("secret-password"));
+        assert!(!auth_debug.contains("secret-user"));
+        assert!(!auth_debug.contains("secret-password"));
+        assert!(builder_debug.contains("[redacted]"));
+        assert!(auth_debug.contains("[redacted]"));
     }
 }

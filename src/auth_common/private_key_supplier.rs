@@ -7,7 +7,7 @@
 use openssl::pkey::Private;
 use openssl::rsa::Rsa;
 use std::error::Error;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 
 use crate::auth_common::file_utils::expand_user_home;
 
@@ -34,10 +34,22 @@ impl Clone for Box<dyn Supplier> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PrivateKeySupplier {
     key_content: String,
     passphrase: Option<Vec<char>>,
+}
+
+impl fmt::Debug for PrivateKeySupplier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrivateKeySupplier")
+            .field("key_content", &"[redacted]")
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl PrivateKeySupplier {
@@ -73,10 +85,22 @@ impl Supplier for PrivateKeySupplier {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FilePrivateKeySupplier {
     key_path: String,
     passphrase: Option<Vec<char>>,
+}
+
+impl fmt::Debug for FilePrivateKeySupplier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilePrivateKeySupplier")
+            .field("key_path", &self.key_path)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 impl FilePrivateKeySupplier {
@@ -126,6 +150,33 @@ impl Supplier for FilePrivateKeySupplier {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_private_key_supplier_debug_redacts_key_and_passphrase() {
+        let supplier = PrivateKeySupplier::new_with_passphrase(
+            "secret-private-key-content".to_string(),
+            Some("secret-passphrase".chars().collect()),
+        );
+
+        let debug = format!("{:?}", supplier);
+
+        assert!(!debug.contains("secret-private-key-content"));
+        assert!(!debug.contains("secret-passphrase"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn test_file_private_key_supplier_debug_redacts_passphrase() {
+        let supplier = FilePrivateKeySupplier::new_with_passphrase(
+            "/home/user/.oci/key.pem".to_string(),
+            Some("secret-passphrase".chars().collect()),
+        );
+
+        let debug = format!("{:?}", supplier);
+
+        assert!(!debug.contains("secret-passphrase"));
+        assert!(debug.contains("[redacted]"));
+    }
 
     #[test]
     #[should_panic]

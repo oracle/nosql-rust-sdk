@@ -12,6 +12,7 @@ use ini::Ini;
 use openssl::pkey::Private;
 use openssl::rsa::Rsa;
 use std::error::Error;
+use std::fmt;
 
 #[allow(dead_code)]
 const DEFAULT_CONFIG_FILE_PATH: &str = "~/.oci/config";
@@ -23,9 +24,17 @@ const FINGERPRINT: &str = "fingerprint";
 const REGION: &str = "region";
 
 /// Struct defining a user-based Authentication Provider that reads all authentication information from config file
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConfigFileAuthenticationProvider {
     auth_provider: SimpleAuthenticationProvider,
+}
+
+impl fmt::Debug for ConfigFileAuthenticationProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigFileAuthenticationProvider")
+            .field("auth_provider", &self.auth_provider)
+            .finish()
+    }
 }
 
 fn get_section_variable(

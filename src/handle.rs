@@ -23,6 +23,7 @@ use crate::reader::Reader;
 use crate::writer::Writer;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::result::Result;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -39,13 +40,20 @@ use url::Url;
 /// Note: there is no need to enclose this struct in an `Rc` or [`Arc`], as it uses an
 /// [`Arc`] internally, so calling `.clone()` on this struct will always return the
 /// same underlying handle.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Handle {
     // Use an inner Arc so cloning keeps the same contents
     pub(crate) inner: Arc<HandleRef>,
 }
 
-#[derive(Debug)]
+impl fmt::Debug for Handle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Handle")
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
 pub(crate) struct HandleRef {
     pub(crate) client: reqwest::Client,
     pub(crate) endpoint: String,
@@ -55,6 +63,19 @@ pub(crate) struct HandleRef {
     session: std::sync::Mutex<String>,
     request_id: AtomicUsize,
     timeout: Duration,
+}
+
+impl fmt::Debug for HandleRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandleRef")
+            .field("endpoint", &self.endpoint)
+            .field("serial_version", &self.serial_version)
+            .field("builder", &self.builder)
+            .field("session", &"[redacted]")
+            .field("request_id", &self.request_id)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl Handle {
@@ -142,8 +163,8 @@ impl Handle {
         ep.push_str(&builder.endpoint);
         ep.push_str("/V2/nosql/data");
         debug!(
-            "Creating new Handle: {:?}, {:?}, endpoint={}",
-            builder.mode, builder.auth, ep
+            "Creating new Handle: mode={:?}, auth_type={:?}, endpoint={}",
+            builder.mode, builder.auth_type, ep
         );
         Ok(Handle {
             inner: Arc::new(HandleRef {
@@ -320,7 +341,7 @@ impl Handle {
             if i.name() == "session" {
                 let mut sguard = self.inner.session.lock().unwrap();
                 *sguard = i.value().to_string();
-                trace!("Setting session={}", i.value());
+                trace!("setting session cookie from response");
             }
         }
         let result = resp.bytes().await?;
@@ -427,4 +448,27 @@ pub(crate) struct SendOptions {
     pub(crate) timeout: Duration,
     pub(crate) compartment_id: String,
     pub(crate) namespace: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_ref_debug_redacts_session_cookie() {
+        let handle_ref = HandleRef {
+            client: reqwest::Client::new(),
+            endpoint: "https://example.com/V2/nosql/data".to_string(),
+            serial_version: 4,
+            builder: HandleBuilder::new(),
+            session: std::sync::Mutex::new("secret-session-cookie".to_string()),
+            request_id: AtomicUsize::new(1),
+            timeout: Duration::new(30, 0),
+        };
+
+        let debug = format!("{:?}", handle_ref);
+
+        assert!(!debug.contains("secret-session-cookie"));
+        assert!(debug.contains("[redacted]"));
+    }
 }
