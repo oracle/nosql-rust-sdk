@@ -176,6 +176,12 @@ impl TableRequest {
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
         let resp = TableRequest::nson_deserialize(&mut r)?;
+        let table_name = if resp.table_name.is_empty() {
+            &self.table_name
+        } else {
+            &resp.table_name
+        };
+        h.update_rate_limiters(table_name, resp.limits.as_ref());
         Ok(resp)
     }
 
@@ -324,6 +330,12 @@ impl GetTableRequest {
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
         let resp = TableRequest::nson_deserialize(&mut r)?;
+        let table_name = if resp.table_name.is_empty() {
+            &self.table_name
+        } else {
+            &resp.table_name
+        };
+        h.update_rate_limiters(table_name, resp.limits.as_ref());
         Ok(resp)
     }
 

@@ -10,7 +10,7 @@ use crate::handle::Handle;
 use crate::handle::SendOptions;
 use crate::nson::*;
 use crate::plan_iter::{deserialize_plan_iter, PlanIterKind, PlanIterState};
-use crate::prepared_statement::PreparedStatement;
+use crate::prepared_statement::{PreparedStatement, PreparedStatementBranch};
 use crate::reader::Reader;
 use crate::receive_iter::ReceiveIterData;
 use crate::types::NoSQLColumnToFieldValue;
@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::result::Result;
 use std::time::Duration;
 use tracing::trace;
+
+const DRIVER_QUERY_VERSION: i32 = 6;
 
 /// Encapsulates a SQL query of a NoSQL Database table.
 ///
@@ -125,6 +127,10 @@ pub struct QueryRequest {
     pub(crate) registers: Vec<FieldValue>,
 
     pub(crate) topology_info: TopologyInfo,
+
+    // Active UNION branch for internal ReceiveIter requests. When set, the
+    // copied internal QueryRequest uses the matching branch prepared query.
+    active_query_branch: Option<usize>,
 }
 
 /// Struct representing the result of a query operation.
@@ -296,6 +302,17 @@ impl QueryRequest {
         self
     }
 
+    fn rate_limit_table_name(&self) -> String {
+        self.prepared_statement
+            .table_name
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn does_writes_for_rate_limiting(&self) -> bool {
+        self.prepared_statement.does_writes()
+    }
+
     // used by ext_var_ref_iter
     pub(crate) fn get_external_var(&self, id: i32) -> Option<&FieldValue> {
         if self.prepared_statement.is_empty() {
@@ -385,14 +402,24 @@ impl QueryRequest {
         }
         QueryRequest {
             is_internal: true,
-            prepared_statement: self.prepared_statement.copy_for_internal(),
+            prepared_statement: self
+                .prepared_statement
+                .copy_for_internal(self.active_query_branch),
             shard_id: self.shard_id,
             //limit: self.limit,
             // purposefully not copying registers
             num_registers: -1,
             timeout: self.timeout.clone(),
+            compartment_id: self.compartment_id.clone(),
+            topology_info: self.topology_info.clone(),
             ..Default::default()
         }
+    }
+
+    pub(crate) fn set_active_query_branch(&mut self, branch: Option<usize>) -> Option<usize> {
+        let previous = self.active_query_branch;
+        self.active_query_branch = branch;
+        previous
     }
 
     pub(crate) fn reset(&mut self) -> Result<(), NoSQLError> {
@@ -589,15 +616,26 @@ impl QueryRequest {
         w.write_i16(handle.inner.serial_version);
         let timeout = handle.get_timeout(&self.timeout);
         self.serialize_internal(&mut w, &timeout)?;
+        let consumed_before = self.consumed_capacity;
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: true,
             compartment_id: self.compartment_id.clone(),
+            table_name: self.rate_limit_table_name(),
+            does_reads: true,
+            does_writes: self.does_writes_for_rate_limiting(),
             ..Default::default()
         };
         let mut r = handle.send_and_receive(w, &mut opts).await?;
         self.continuation_key = None;
         self.nson_deserialize(&mut r, results, iter_data)?;
+        let batch_consumed = self.consumed_capacity.delta_since(&consumed_before);
+        let table_name = self.rate_limit_table_name();
+        if !table_name.is_empty() {
+            handle
+                .consume_rate_limited_capacity(&mut opts, &table_name, &batch_consumed)
+                .await;
+        }
         if self.continuation_key.is_none() {
             trace!("continuation key is None, setting is_done");
             self.is_done = true;
@@ -637,7 +675,7 @@ impl QueryRequest {
         //writeMapField(ns, TRACE_AT_LOG_FILES, rq.getLogFileTracing());
         //writeMapField(ns, BATCH_COUNTER, rq.getBatchCounter());
 
-        ns.write_i32_field(QUERY_VERSION, 3); // TODO: QUERY_V4
+        ns.write_i32_field(QUERY_VERSION, DRIVER_QUERY_VERSION);
         if self.prepared_statement.is_empty() == false {
             ns.write_bool_field(IS_PREPARED, true);
             ns.write_bool_field(IS_SIMPLE_QUERY, self.prepared_statement.is_simple());
@@ -769,6 +807,20 @@ impl QueryRequest {
                     }
                     self.prepared_statement.statement = walker.read_nson_binary()?;
                 }
+                QUERY_BRANCHES => {
+                    if is_prepared_request {
+                        return ia_err!("got query branches in result for already prepared query");
+                    }
+                    self.prepared_statement.branches = Self::read_query_branches(&mut walker)?;
+                    if self.prepared_statement.statement.is_empty()
+                        && self.prepared_statement.branches.len() > 0
+                    {
+                        let branch = &self.prepared_statement.branches[0];
+                        self.prepared_statement.statement = branch.statement.clone();
+                        self.prepared_statement.table_name = branch.table_name.clone();
+                        self.prepared_statement.namespace = branch.namespace.clone();
+                    }
+                }
                 DRIVER_QUERY_PLAN => {
                     if is_prepared_request {
                         return ia_err!("got driver plan in result for already prepared query");
@@ -864,6 +916,40 @@ impl QueryRequest {
         }
 
         Ok(())
+    }
+
+    fn read_query_branches(
+        walker: &mut MapWalker,
+    ) -> Result<Vec<PreparedStatementBranch>, NoSQLError> {
+        let fv = walker.read_nson_field_value()?;
+        let branches = match fv {
+            FieldValue::Array(branches) => branches,
+            _ => {
+                return ia_err!("bad type in query branches: expected Array");
+            }
+        };
+
+        let mut result = Vec::with_capacity(branches.len());
+        for branch in branches {
+            let mv = match branch {
+                FieldValue::Map(mv) => mv,
+                _ => {
+                    return ia_err!("bad type in query branch: expected Map");
+                }
+            };
+            let statement = match mv.get_field_value(PREPARED_QUERY) {
+                Some(FieldValue::Binary(bytes)) => bytes.clone(),
+                _ => {
+                    return ia_err!("query branch is missing prepared query");
+                }
+            };
+            result.push(PreparedStatementBranch {
+                statement,
+                table_name: mv.get_string(TABLE_NAME),
+                namespace: mv.get_string(NAMESPACE),
+            });
+        }
+        Ok(result)
     }
 
     fn get_driver_plan_info(&mut self, v: &Vec<u8>) -> Result<(), NoSQLError> {
