@@ -212,5 +212,5 @@ impl CollectIter {
 }
 
 fn sort_func(v1: &FieldValue, v2: &FieldValue) -> Ordering {
-    compare_field_values(v2, v1, false)
+    compare_field_values(v1, v2, false)
 }

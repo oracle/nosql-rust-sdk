@@ -5,8 +5,12 @@
 //  https://oss.oracle.com/licenses/upl/
 //
 use crate::aggr_iter::{FuncMinMaxIter, FuncSumIter};
+use crate::and_or_iter::AndOrIter;
 use crate::arith_op_iter::ArithOpIter;
+use crate::array_constr_iter::ArrayConstrIter;
+use crate::case_iter::CaseIter;
 use crate::collect_iter::CollectIter;
+use crate::comp_op_iter::CompOpIter;
 use crate::const_iter::ConstIter;
 use crate::const_iter::EmptyIter;
 use crate::error::ia_err;
@@ -16,13 +20,16 @@ use crate::ext_var_iter::ExtVarIter;
 use crate::field_step_iter::FieldStepIter;
 use crate::group_iter::GroupIter;
 use crate::handle::Handle;
+use crate::is_null_iter::IsNullIter;
 use crate::query_request::QueryRequest;
 use crate::reader::Reader;
 use crate::receive_iter::ReceiveIter;
+use crate::seq_aggr_iter::FuncSeqAggrIter;
 use crate::sfw_iter::SfwIter;
 use crate::size_iter::SizeIter;
 use crate::sort_iter::SortIter;
 use crate::types::FieldValue;
+use crate::union_iter::UnionIter;
 use crate::var_ref_iter::VarRefIter;
 
 use core::fmt::Debug;
@@ -40,17 +47,24 @@ pub(crate) enum PlanIterKind {
     Const = 0,
     VarRef = 1,
     ExtVar = 2,
+    ArrayConstr = 3,
+    ValueCompare = 5,
+    AndOr = 7,
     ArithOp = 8,
     FieldStep = 11,
     Sfw = 14,
     Size = 15,
     Recv = 17,
+    Case = 19,
+    IsNull = 26,
     SumFunc = 39,
     MinMaxFunc = 41,
     Sorting = 47,
+    SeqAggr = 48,
     Group = 65,
     Sorting2 = 66,
     Collect = 78,
+    Union = 90,
 }
 
 impl PlanIterKind {
@@ -73,15 +87,35 @@ impl PlanIterKind {
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, PartialOrd, TryFromPrimitive)]
 #[repr(u16)]
 pub(crate) enum FuncCode {
+    OpAnd = 0,
+    OpOr = 1,
+    OpEq = 2,
+    OpNeq = 3,
+    OpGt = 4,
+    OpGe = 5,
+    OpLt = 6,
+    OpLe = 7,
     OpAddSub = 14,
     OpMultDiv = 15,
+    OpIsNull = 22,
+    OpIsNotNull = 23,
     FnCountStar = 42,
     #[default]
     FnCount = 43,
     FnCountNumbers = 44,
     FnSum = 45,
+    FnAvg = 46,
     FnMin = 47,
     FnMax = 48,
+    FnSeqCount = 49,
+    FnSeqSum = 50,
+    FnSeqAvg = 51,
+    FnSeqMin = 52,
+    FnSeqMax = 53,
+    FnSeqCountI = 76,
+    FnSeqCountNumbersI = 77,
+    FnSeqMinI = 78,
+    FnSeqMaxI = 79,
     ArrayCollect = 91,
     ArrayCollectDistinct = 92,
 }
@@ -106,10 +140,15 @@ impl FuncCode {
 pub enum PlanIter {
     Empty(EmptyIter),
     Const(ConstIter),
+    AndOr(AndOrIter),
+    ArrayConstr(ArrayConstrIter),
     ArithOp(ArithOpIter),
+    Case(CaseIter),
+    CompOp(CompOpIter),
     Receive(ReceiveIter),
     Sfw(SfwIter),
     Size(SizeIter),
+    IsNull(IsNullIter),
     FieldStep(FieldStepIter),
     VarRef(VarRefIter),
     ExtVar(ExtVarIter),
@@ -117,7 +156,9 @@ pub enum PlanIter {
     Group(GroupIter),
     SumFunc(FuncSumIter),
     MinMaxFunc(FuncMinMaxIter),
+    SeqAggr(FuncSeqAggrIter),
     Collect(CollectIter),
+    Union(UnionIter),
 }
 
 impl Default for PlanIter {
@@ -133,18 +174,25 @@ impl PlanIter {
         match self {
             PlanIter::Empty(ref mut e) => e.open(req, handle),
             PlanIter::Const(ref mut c) => c.open(req, handle),
+            PlanIter::AndOr(ref mut r) => r.open(req, handle),
+            PlanIter::ArrayConstr(ref mut r) => r.open(req, handle),
             PlanIter::Receive(ref mut r) => r.open(req, handle),
             PlanIter::Sfw(ref mut r) => r.open(req, handle),
             PlanIter::FieldStep(ref mut r) => r.open(req, handle),
+            PlanIter::IsNull(ref mut r) => r.open(req, handle),
             PlanIter::VarRef(ref mut r) => r.open(req, handle),
             PlanIter::ExtVar(ref mut r) => r.open(req, handle),
             PlanIter::Sorting(ref mut r) => r.open(req, handle),
             PlanIter::Group(ref mut r) => r.open(req, handle),
             PlanIter::SumFunc(ref mut r) => r.open(req, handle),
             PlanIter::MinMaxFunc(ref mut r) => r.open(req, handle),
+            PlanIter::SeqAggr(ref mut r) => r.open(req, handle),
             PlanIter::ArithOp(ref mut r) => r.open(req, handle),
+            PlanIter::Case(ref mut r) => r.open(req, handle),
+            PlanIter::CompOp(ref mut r) => r.open(req, handle),
             PlanIter::Collect(ref mut r) => r.open(req, handle),
             PlanIter::Size(ref mut r) => r.open(req, handle),
+            PlanIter::Union(ref mut r) => r.open(req, handle),
         }
     }
     // get next single FieldValue (retrieved by get_result)
@@ -160,18 +208,25 @@ impl PlanIter {
         match self {
             PlanIter::Empty(ref mut e) => e.next(req).await,
             PlanIter::Const(ref mut c) => c.next(req).await,
+            PlanIter::AndOr(ref mut r) => r.next(req, handle).await,
+            PlanIter::ArrayConstr(ref mut r) => r.next(req, handle).await,
             PlanIter::Receive(ref mut r) => r.next(req, handle).await,
             PlanIter::Sfw(ref mut r) => r.next(req, handle).await,
             PlanIter::FieldStep(ref mut r) => r.next(req, handle).await,
+            PlanIter::IsNull(ref mut r) => r.next(req, handle).await,
             PlanIter::VarRef(ref mut r) => r.next(req, handle).await,
             PlanIter::ExtVar(ref mut r) => r.next(req, handle).await,
             PlanIter::Sorting(ref mut r) => r.next(req, handle).await,
             PlanIter::Group(ref mut r) => r.next(req, handle).await,
             PlanIter::SumFunc(ref mut r) => r.next(req, handle).await,
             PlanIter::MinMaxFunc(ref mut r) => r.next(req, handle).await,
+            PlanIter::SeqAggr(ref mut r) => r.next(req, handle).await,
             PlanIter::ArithOp(ref mut r) => r.next(req, handle).await,
+            PlanIter::Case(ref mut r) => r.next(req, handle).await,
+            PlanIter::CompOp(ref mut r) => r.next(req, handle).await,
             PlanIter::Collect(ref mut r) => r.next(req, handle).await,
             PlanIter::Size(ref mut r) => r.next(req, handle).await,
+            PlanIter::Union(ref mut r) => r.next(req, handle).await,
         }
     }
     // close and release any resources used during looping
@@ -200,36 +255,50 @@ impl PlanIter {
         match self {
             PlanIter::Empty(ref mut e) => e.reset(),
             PlanIter::Const(ref mut c) => c.reset(),
+            PlanIter::AndOr(ref mut r) => r.reset(),
+            PlanIter::ArrayConstr(ref mut r) => r.reset(),
             PlanIter::Receive(ref mut r) => r.reset(),
             PlanIter::Sfw(ref mut r) => r.reset(),
             PlanIter::FieldStep(ref mut r) => r.reset(),
+            PlanIter::IsNull(ref mut r) => r.reset(),
             PlanIter::VarRef(ref mut r) => r.reset(),
             PlanIter::ExtVar(ref mut r) => r.reset(),
             PlanIter::Sorting(ref mut r) => r.reset(),
             PlanIter::Group(ref mut r) => r.reset(),
             PlanIter::SumFunc(ref mut r) => r.reset(),
             PlanIter::MinMaxFunc(ref mut r) => r.reset(),
+            PlanIter::SeqAggr(ref mut r) => r.reset(),
             PlanIter::ArithOp(ref mut r) => r.reset(),
+            PlanIter::Case(ref mut r) => r.reset(),
+            PlanIter::CompOp(ref mut r) => r.reset(),
             PlanIter::Collect(ref mut r) => r.reset(),
             PlanIter::Size(ref mut r) => r.reset(),
+            PlanIter::Union(ref mut r) => r.reset(),
         }
     }
     pub fn get_kind(&self) -> PlanIterKind {
         match self {
             PlanIter::Empty(ref e) => e.get_kind(),
             PlanIter::Const(ref c) => c.get_kind(),
+            PlanIter::AndOr(ref r) => r.get_kind(),
+            PlanIter::ArrayConstr(ref r) => r.get_kind(),
             PlanIter::Receive(ref r) => r.get_kind(),
             PlanIter::Sfw(ref r) => r.get_kind(),
             PlanIter::FieldStep(ref r) => r.get_kind(),
+            PlanIter::IsNull(ref r) => r.get_kind(),
             PlanIter::VarRef(ref r) => r.get_kind(),
             PlanIter::ExtVar(ref r) => r.get_kind(),
             PlanIter::Sorting(ref r) => r.get_kind(),
             PlanIter::Group(ref r) => r.get_kind(),
             PlanIter::SumFunc(ref r) => r.get_kind(),
             PlanIter::MinMaxFunc(ref r) => r.get_kind(),
+            PlanIter::SeqAggr(ref r) => r.get_kind(),
             PlanIter::ArithOp(ref r) => r.get_kind(),
+            PlanIter::Case(ref r) => r.get_kind(),
+            PlanIter::CompOp(ref r) => r.get_kind(),
             PlanIter::Collect(ref r) => r.get_kind(),
             PlanIter::Size(ref r) => r.get_kind(),
+            PlanIter::Union(ref r) => r.get_kind(),
         }
     }
     // this will move the result out of the iterator (owned by the caller)
@@ -238,18 +307,25 @@ impl PlanIter {
         match self {
             PlanIter::Empty(e) => e.get_result(req),
             PlanIter::Const(c) => c.get_result(req),
+            PlanIter::AndOr(r) => r.get_result(req),
+            PlanIter::ArrayConstr(r) => r.get_result(req),
             PlanIter::Receive(r) => r.get_result(req),
             PlanIter::Sfw(r) => r.get_result(req),
             PlanIter::FieldStep(r) => r.get_result(req),
+            PlanIter::IsNull(r) => r.get_result(req),
             PlanIter::VarRef(r) => r.get_result(req),
             PlanIter::ExtVar(r) => r.get_result(req),
             PlanIter::Sorting(r) => r.get_result(req),
             PlanIter::Group(r) => r.get_result(req),
             PlanIter::SumFunc(r) => r.get_result(req),
             PlanIter::MinMaxFunc(r) => r.get_result(req),
+            PlanIter::SeqAggr(r) => r.get_result(req),
             PlanIter::ArithOp(r) => r.get_result(req),
+            PlanIter::Case(r) => r.get_result(req),
+            PlanIter::CompOp(r) => r.get_result(req),
             PlanIter::Collect(r) => r.get_result(req),
             PlanIter::Size(r) => r.get_result(req),
+            PlanIter::Union(r) => r.get_result(req),
         }
     }
     // this will move the result into the iterator (owned by the iterator)
@@ -257,36 +333,50 @@ impl PlanIter {
         match self {
             PlanIter::Empty(e) => e.set_result(req, result),
             PlanIter::Const(c) => c.set_result(req, result),
+            PlanIter::AndOr(r) => r.set_result(req, result),
+            PlanIter::ArrayConstr(r) => r.set_result(req, result),
             PlanIter::Receive(r) => r.set_result(req, result),
             PlanIter::Sfw(r) => r.set_result(req, result),
             PlanIter::FieldStep(r) => r.set_result(req, result),
+            PlanIter::IsNull(r) => r.set_result(req, result),
             PlanIter::VarRef(r) => r.set_result(req, result),
             PlanIter::ExtVar(r) => r.set_result(req, result),
             PlanIter::Sorting(r) => r.set_result(req, result),
             PlanIter::Group(r) => r.set_result(req, result),
             PlanIter::SumFunc(r) => r.set_result(req, result),
             PlanIter::MinMaxFunc(r) => r.set_result(req, result),
+            PlanIter::SeqAggr(r) => r.set_result(req, result),
             PlanIter::ArithOp(r) => r.set_result(req, result),
+            PlanIter::Case(r) => r.set_result(req, result),
+            PlanIter::CompOp(r) => r.set_result(req, result),
             PlanIter::Collect(r) => r.set_result(req, result),
             PlanIter::Size(r) => r.set_result(req, result),
+            PlanIter::Union(r) => r.set_result(req, result),
         }
     }
     pub fn get_state(&self) -> PlanIterState {
         match self {
             PlanIter::Empty(ref e) => e.get_state(),
             PlanIter::Const(ref c) => c.get_state(),
+            PlanIter::AndOr(ref r) => r.get_state(),
+            PlanIter::ArrayConstr(ref r) => r.get_state(),
             PlanIter::Receive(ref r) => r.get_state(),
             PlanIter::Sfw(ref r) => r.get_state(),
             PlanIter::FieldStep(ref r) => r.get_state(),
+            PlanIter::IsNull(ref r) => r.get_state(),
             PlanIter::VarRef(ref r) => r.get_state(),
             PlanIter::ExtVar(ref r) => r.get_state(),
             PlanIter::Sorting(ref r) => r.get_state(),
             PlanIter::Group(ref r) => r.get_state(),
             PlanIter::SumFunc(ref r) => r.get_state(),
             PlanIter::MinMaxFunc(ref r) => r.get_state(),
+            PlanIter::SeqAggr(ref r) => r.get_state(),
             PlanIter::ArithOp(ref r) => r.get_state(),
+            PlanIter::Case(ref r) => r.get_state(),
+            PlanIter::CompOp(ref r) => r.get_state(),
             PlanIter::Collect(ref r) => r.get_state(),
             PlanIter::Size(ref r) => r.get_state(),
+            PlanIter::Union(ref r) => r.get_state(),
         }
     }
 
@@ -360,18 +450,25 @@ impl PlanIter {
         match self {
             PlanIter::Empty(ref e) => e.get_aggr_value(req, reset),
             PlanIter::Const(ref c) => c.get_aggr_value(req, reset),
+            PlanIter::AndOr(ref r) => r.get_aggr_value(req, reset),
+            PlanIter::ArrayConstr(ref r) => r.get_aggr_value(req, reset),
             PlanIter::Receive(ref r) => r.get_aggr_value(req, reset),
             PlanIter::Sfw(ref r) => r.get_aggr_value(req, reset),
             PlanIter::FieldStep(ref r) => r.get_aggr_value(req, reset),
+            PlanIter::IsNull(ref r) => r.get_aggr_value(req, reset),
             PlanIter::VarRef(ref r) => r.get_aggr_value(req, reset),
             PlanIter::ExtVar(ref r) => r.get_aggr_value(req, reset),
             PlanIter::Sorting(ref r) => r.get_aggr_value(req, reset),
             PlanIter::Group(ref r) => r.get_aggr_value(req, reset),
             PlanIter::SumFunc(ref mut r) => r.get_aggr_value(req, reset),
             PlanIter::MinMaxFunc(ref mut r) => r.get_aggr_value(req, reset),
+            PlanIter::SeqAggr(ref r) => r.get_aggr_value(req, reset),
             PlanIter::ArithOp(ref mut r) => r.get_aggr_value(req, reset),
+            PlanIter::Case(ref r) => r.get_aggr_value(req, reset),
+            PlanIter::CompOp(ref r) => r.get_aggr_value(req, reset),
             PlanIter::Collect(ref mut r) => r.get_aggr_value(req, reset),
             PlanIter::Size(ref mut r) => r.get_aggr_value(req, reset),
+            PlanIter::Union(ref r) => r.get_aggr_value(req, reset),
         }
     }
 }
@@ -414,10 +511,16 @@ pub(crate) fn deserialize_plan_iter(r: &mut Reader) -> Result<Box<PlanIter>, NoS
         PlanIterKind::Const => Ok(Box::new(PlanIter::Const(ConstIter::new(r)?))),
         PlanIterKind::VarRef => Ok(Box::new(PlanIter::VarRef(VarRefIter::new(r)?))),
         PlanIterKind::ExtVar => Ok(Box::new(PlanIter::ExtVar(ExtVarIter::new(r)?))),
+        PlanIterKind::AndOr => Ok(Box::new(PlanIter::AndOr(AndOrIter::new(r)?))),
+        PlanIterKind::ArrayConstr => Ok(Box::new(PlanIter::ArrayConstr(ArrayConstrIter::new(r)?))),
         PlanIterKind::ArithOp => Ok(Box::new(PlanIter::ArithOp(ArithOpIter::new(r)?))),
+        PlanIterKind::Case => Ok(Box::new(PlanIter::Case(CaseIter::new(r)?))),
+        PlanIterKind::ValueCompare => Ok(Box::new(PlanIter::CompOp(CompOpIter::new(r)?))),
         PlanIterKind::FieldStep => Ok(Box::new(PlanIter::FieldStep(FieldStepIter::new(r)?))),
+        PlanIterKind::IsNull => Ok(Box::new(PlanIter::IsNull(IsNullIter::new(r)?))),
         PlanIterKind::SumFunc => Ok(Box::new(PlanIter::SumFunc(FuncSumIter::new(r)?))),
         PlanIterKind::MinMaxFunc => Ok(Box::new(PlanIter::MinMaxFunc(FuncMinMaxIter::new(r)?))),
+        PlanIterKind::SeqAggr => Ok(Box::new(PlanIter::SeqAggr(FuncSeqAggrIter::new(r)?))),
         PlanIterKind::Collect => Ok(Box::new(PlanIter::Collect(CollectIter::new(r)?))),
         PlanIterKind::Size => Ok(Box::new(PlanIter::Size(SizeIter::new(r)?))),
         PlanIterKind::Sorting => Ok(Box::new(PlanIter::Sorting(SortIter::new(r, kind)?))),
@@ -425,6 +528,7 @@ pub(crate) fn deserialize_plan_iter(r: &mut Reader) -> Result<Box<PlanIter>, NoS
         PlanIterKind::Sfw => Ok(Box::new(PlanIter::Sfw(SfwIter::new(r)?))),
         PlanIterKind::Recv => Ok(Box::new(PlanIter::Receive(ReceiveIter::new(r)?))),
         PlanIterKind::Group => Ok(Box::new(PlanIter::Group(GroupIter::new(r)?))),
+        PlanIterKind::Union => Ok(Box::new(PlanIter::Union(UnionIter::new(r)?))),
     }
 }
 

@@ -154,6 +154,10 @@ impl DeleteRequest {
         self
     }
 
+    fn does_reads(&self) -> bool {
+        self.return_row || self.match_version.len() > 0
+    }
+
     pub async fn execute(&self, h: &Handle) -> Result<DeleteResult, NoSQLError> {
         let mut w: Writer = Writer::new();
         w.write_i16(h.inner.serial_version);
@@ -163,10 +167,17 @@ impl DeleteRequest {
             timeout: timeout,
             retryable: true,
             compartment_id: self.compartment_id.clone(),
+            table_name: self.table_name.clone(),
+            does_reads: self.does_reads(),
+            does_writes: true,
             ..Default::default()
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
         let resp = DeleteRequest::nson_deserialize(&mut r)?;
+        if let Some(consumed) = resp.consumed.as_ref() {
+            h.consume_rate_limited_capacity(&mut opts, &self.table_name, consumed)
+                .await;
+        }
         Ok(resp)
     }
 
@@ -292,5 +303,9 @@ impl NsonRequest for DeleteRequest {
 impl NsonSubRequest for DeleteRequest {
     fn serialize(&self, w: &mut Writer, timeout: &Duration) {
         self.serialize_internal(w, true, false, timeout);
+    }
+
+    fn does_reads(&self) -> bool {
+        DeleteRequest::does_reads(self)
     }
 }

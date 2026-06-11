@@ -19,17 +19,25 @@ use crate::handle_builder::AuthProvider;
 use crate::handle_builder::HandleBuilder;
 use crate::handle_builder::HandleMode;
 use crate::nson::MapWalker;
+use crate::rate_limiter::RateLimiter;
 use crate::reader::Reader;
+use crate::table_request::{GetTableRequest, TableRequest};
+use crate::types::{Capacity, TableLimits};
 use crate::writer::Writer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::result::Result;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 use url::Url;
+
+const RATE_LIMITER_DURATION_SECS: f64 = 30.0;
+const RATE_LIMITER_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
+const RATE_LIMITER_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const RATE_LIMITER_METADATA_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// **The main database handle**.
 ///
@@ -51,10 +59,167 @@ pub(crate) struct HandleRef {
     pub(crate) endpoint: String,
     pub(crate) serial_version: i16,
     pub(crate) builder: HandleBuilder,
+    rate_limiter_map: Option<RateLimiterMap>,
     // session doesn't require a tokio Mutex because it's never held across awaits
     session: std::sync::Mutex<String>,
     request_id: AtomicUsize,
     timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct RateLimiterEntry {
+    read_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
+    write_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
+    read_units: f64,
+    write_units: f64,
+}
+
+#[derive(Debug)]
+struct RateLimiterMap {
+    limiters: std::sync::Mutex<HashMap<RateLimiterKey, RateLimiterEntry>>,
+    refresh_after: std::sync::Mutex<HashMap<RateLimiterKey, Instant>>,
+    refreshing: std::sync::Mutex<HashSet<RateLimiterKey>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RateLimiterKey {
+    table_name: String,
+    compartment_id: String,
+}
+
+impl RateLimiterEntry {
+    fn new(read_units: f64, write_units: f64) -> Self {
+        RateLimiterEntry {
+            read_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new_with_duration(
+                read_units,
+                RATE_LIMITER_DURATION_SECS,
+            ))),
+            write_limiter: Arc::new(tokio::sync::Mutex::new(RateLimiter::new_with_duration(
+                write_units,
+                RATE_LIMITER_DURATION_SECS,
+            ))),
+            read_units,
+            write_units,
+        }
+    }
+
+    fn has_limits(&self, read_units: f64, write_units: f64) -> bool {
+        self.read_units == read_units && self.write_units == write_units
+    }
+}
+
+impl RateLimiterMap {
+    fn new() -> Self {
+        RateLimiterMap {
+            limiters: std::sync::Mutex::new(HashMap::new()),
+            refresh_after: std::sync::Mutex::new(HashMap::new()),
+            refreshing: std::sync::Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn key(table_name: &str, compartment_id: &str) -> RateLimiterKey {
+        RateLimiterKey {
+            table_name: table_name.to_lowercase(),
+            compartment_id: compartment_id.to_string(),
+        }
+    }
+
+    fn get(&self, table_name: &str, compartment_id: &str) -> Option<RateLimiterEntry> {
+        if table_name.is_empty() {
+            return None;
+        }
+        self.limiters
+            .lock()
+            .unwrap()
+            .get(&Self::key(table_name, compartment_id))
+            .cloned()
+    }
+
+    fn needs_refresh(&self, table_name: &str, compartment_id: &str) -> bool {
+        if table_name.is_empty() {
+            return false;
+        }
+        let key = Self::key(table_name, compartment_id);
+        let guard = self.refresh_after.lock().unwrap();
+        match guard.get(&key) {
+            Some(refresh_after) => *refresh_after <= Instant::now(),
+            None => true,
+        }
+    }
+
+    fn mark_refreshed(&self, table_name: &str, compartment_id: &str) {
+        self.mark_next_refresh(table_name, compartment_id, RATE_LIMITER_REFRESH_INTERVAL);
+    }
+
+    fn mark_retry_soon(&self, table_name: &str, compartment_id: &str) {
+        self.mark_next_refresh(table_name, compartment_id, RATE_LIMITER_RETRY_INTERVAL);
+    }
+
+    fn mark_next_refresh(&self, table_name: &str, compartment_id: &str, delay: Duration) {
+        if table_name.is_empty() {
+            return;
+        }
+        self.refresh_after.lock().unwrap().insert(
+            Self::key(table_name, compartment_id),
+            Instant::now() + delay,
+        );
+    }
+
+    fn try_start_refresh(&self, table_name: &str, compartment_id: &str) -> bool {
+        if table_name.is_empty() {
+            return false;
+        }
+        self.refreshing
+            .lock()
+            .unwrap()
+            .insert(Self::key(table_name, compartment_id))
+    }
+
+    fn finish_refresh(&self, table_name: &str, compartment_id: &str) {
+        if table_name.is_empty() {
+            return;
+        }
+        self.refreshing
+            .lock()
+            .unwrap()
+            .remove(&Self::key(table_name, compartment_id));
+    }
+
+    fn update(
+        &self,
+        table_name: &str,
+        compartment_id: &str,
+        limits: Option<&TableLimits>,
+        percentage: f64,
+    ) -> bool {
+        if table_name.is_empty() {
+            return false;
+        }
+        self.mark_refreshed(table_name, compartment_id);
+
+        let key = Self::key(table_name, compartment_id);
+        let Some(limits) = limits else {
+            self.limiters.lock().unwrap().remove(&key);
+            return false;
+        };
+
+        if limits.read_units <= 0 && limits.write_units <= 0 {
+            self.limiters.lock().unwrap().remove(&key);
+            return false;
+        }
+
+        let read_units = (limits.read_units as f64 * percentage) / 100.0;
+        let write_units = (limits.write_units as f64 * percentage) / 100.0;
+        let mut guard = self.limiters.lock().unwrap();
+        if guard
+            .get(&key)
+            .is_some_and(|entry| entry.has_limits(read_units, write_units))
+        {
+            return true;
+        }
+        guard.insert(key, RateLimiterEntry::new(read_units, write_units));
+        true
+    }
 }
 
 impl Handle {
@@ -145,12 +310,19 @@ impl Handle {
             "Creating new Handle: {:?}, {:?}, endpoint={}",
             builder.mode, builder.auth, ep
         );
+        let rate_limiter_map =
+            if builder.rate_limiting_enabled && builder.mode != HandleMode::Onprem {
+                Some(RateLimiterMap::new())
+            } else {
+                None
+            };
         Ok(Handle {
             inner: Arc::new(HandleRef {
                 client: c,
                 endpoint: ep,
                 serial_version: 4,
                 builder: builder,
+                rate_limiter_map,
                 timeout: timeout.clone(),
                 session: std::sync::Mutex::new("".to_string()),
                 request_id: AtomicUsize::new(1),
@@ -334,9 +506,29 @@ impl Handle {
         w: Writer,
         send_options: &mut SendOptions,
     ) -> Result<Reader, NoSQLError> {
+        self.send_and_receive_internal(w, send_options, true).await
+    }
+
+    async fn send_and_receive_without_rate_limiting(
+        &self,
+        w: Writer,
+        send_options: &mut SendOptions,
+    ) -> Result<Reader, NoSQLError> {
+        self.send_and_receive_internal(w, send_options, false).await
+    }
+
+    async fn send_and_receive_internal(
+        &self,
+        w: Writer,
+        send_options: &mut SendOptions,
+        apply_rate_limiting: bool,
+    ) -> Result<Reader, NoSQLError> {
         send_options.retries = 0;
         loop {
-            match self.send_and_receive_once(&w, send_options).await {
+            match self
+                .send_and_receive_once_internal(&w, send_options, apply_rate_limiting)
+                .await
+            {
                 Ok(r) => return Ok(r),
                 Err(e) => {
                     if e.code == InternalRetry {
@@ -350,11 +542,15 @@ impl Handle {
         }
     }
 
-    pub(crate) async fn send_and_receive_once(
+    async fn send_and_receive_once_internal(
         &self,
         w: &Writer,
         send_options: &mut SendOptions,
+        apply_rate_limiting: bool,
     ) -> Result<Reader, NoSQLError> {
+        if apply_rate_limiting {
+            self.apply_rate_limiting(send_options).await?;
+        }
         let bytes = self.post_data(&w.buf, send_options).await?;
 
         //println!("returned data: len={}", bytes.len());
@@ -410,6 +606,265 @@ impl Handle {
         Err(err)
     }
 
+    async fn apply_rate_limiting(&self, send_options: &mut SendOptions) -> Result<(), NoSQLError> {
+        if !send_options.does_reads && !send_options.does_writes {
+            return Ok(());
+        }
+        let Some(entry) = self
+            .rate_limiters_for_table(
+                &send_options.table_name,
+                &send_options.compartment_id,
+                send_options.timeout,
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        if send_options.does_reads {
+            send_options.rate_limit_delayed_ms +=
+                Self::consume_rate_limiter(&entry.read_limiter, 0, send_options.timeout, true)
+                    .await?;
+        }
+        if send_options.does_writes {
+            send_options.rate_limit_delayed_ms +=
+                Self::consume_rate_limiter(&entry.write_limiter, 0, send_options.timeout, true)
+                    .await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn consume_rate_limited_capacity(
+        &self,
+        send_options: &mut SendOptions,
+        table_name: &str,
+        consumed: &Capacity,
+    ) {
+        if consumed.read_units <= 0 && consumed.write_kb <= 0 {
+            return;
+        }
+        let Some(entry) = self
+            .rate_limiters_for_table(
+                table_name,
+                &send_options.compartment_id,
+                send_options.timeout,
+            )
+            .await
+        else {
+            return;
+        };
+
+        if consumed.read_units > 0 {
+            let delay = Self::consume_rate_limiter(
+                &entry.read_limiter,
+                consumed.read_units as i64,
+                send_options.timeout,
+                false,
+            )
+            .await
+            .unwrap_or(0);
+            send_options.rate_limit_delayed_ms += delay;
+        }
+
+        if consumed.write_kb > 0 {
+            let delay = Self::consume_rate_limiter(
+                &entry.write_limiter,
+                consumed.write_kb as i64,
+                send_options.timeout,
+                false,
+            )
+            .await
+            .unwrap_or(0);
+            send_options.rate_limit_delayed_ms += delay;
+        }
+    }
+
+    async fn consume_rate_limiter(
+        limiter: &Arc<tokio::sync::Mutex<RateLimiter>>,
+        units: i64,
+        timeout: Duration,
+        fail_on_timeout: bool,
+    ) -> Result<i64, NoSQLError> {
+        let timeout_ms = Self::duration_to_millis(timeout);
+        let delay_ms = {
+            let mut guard = limiter.lock().await;
+            guard.reserve_units_with_timeout(units, timeout_ms, false)
+        };
+
+        match delay_ms {
+            Ok(delay_ms) => {
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+                }
+                Ok(delay_ms)
+            }
+            Err(e) => {
+                if timeout_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(timeout_ms as u64)).await;
+                }
+                if fail_on_timeout {
+                    return Err(NoSQLError::new(
+                        NoSQLErrorCode::RequestTimeout,
+                        &format!(
+                            "timed out waiting {}ms due to rate limiting: {}",
+                            timeout_ms,
+                            e.to_string()
+                        ),
+                    ));
+                }
+                Ok(timeout_ms)
+            }
+        }
+    }
+
+    async fn rate_limiters_for_table(
+        &self,
+        table_name: &str,
+        compartment_id: &str,
+        timeout: Duration,
+    ) -> Option<RateLimiterEntry> {
+        let Some(map) = &self.inner.rate_limiter_map else {
+            return None;
+        };
+        if table_name.is_empty() {
+            return None;
+        }
+        let compartment_id = self.effective_rate_limiter_compartment_id(compartment_id);
+        if let Some(entry) = map.get(table_name, &compartment_id) {
+            if map.needs_refresh(table_name, &compartment_id) {
+                self.refresh_rate_limiter_in_background(
+                    table_name.to_string(),
+                    compartment_id.clone(),
+                    timeout,
+                );
+            }
+            return Some(entry);
+        }
+
+        if !map.needs_refresh(table_name, &compartment_id) {
+            return None;
+        }
+        if !map.try_start_refresh(table_name, &compartment_id) {
+            return None;
+        }
+
+        self.refresh_rate_limiter(table_name.to_string(), compartment_id.clone(), timeout)
+            .await;
+        map.get(table_name, &compartment_id)
+    }
+
+    fn refresh_rate_limiter_in_background(
+        &self,
+        table_name: String,
+        compartment_id: String,
+        timeout: Duration,
+    ) {
+        let Some(map) = &self.inner.rate_limiter_map else {
+            return;
+        };
+        if !map.try_start_refresh(&table_name, &compartment_id) {
+            return;
+        }
+
+        let handle = self.clone();
+        tokio::spawn(async move {
+            handle
+                .refresh_rate_limiter(table_name, compartment_id, timeout)
+                .await;
+        });
+    }
+
+    async fn refresh_rate_limiter(
+        &self,
+        table_name: String,
+        compartment_id: String,
+        timeout: Duration,
+    ) {
+        let Some(map) = &self.inner.rate_limiter_map else {
+            return;
+        };
+        let metadata_timeout = if timeout < RATE_LIMITER_METADATA_TIMEOUT {
+            timeout
+        } else {
+            RATE_LIMITER_METADATA_TIMEOUT
+        };
+        let mut request = GetTableRequest::new(&table_name).timeout(&metadata_timeout);
+        if !compartment_id.is_empty() {
+            request = request.compartment_id(&compartment_id);
+        }
+        let mut w: Writer = Writer::new();
+        w.write_i16(self.inner.serial_version);
+        request.nson_serialize(&mut w, &metadata_timeout);
+        let mut opts = SendOptions {
+            timeout: metadata_timeout,
+            retryable: true,
+            compartment_id: compartment_id.clone(),
+            ..Default::default()
+        };
+        match Box::pin(self.send_and_receive_without_rate_limiting(w, &mut opts)).await {
+            Ok(mut r) => match TableRequest::nson_deserialize(&mut r) {
+                Ok(resp) => {
+                    let result_table_name = if resp.table_name.is_empty() {
+                        &table_name
+                    } else {
+                        &resp.table_name
+                    };
+                    self.update_rate_limiters(
+                        result_table_name,
+                        &compartment_id,
+                        resp.limits.as_ref(),
+                    );
+                }
+                Err(e) => {
+                    trace!(
+                        "rate limiter GetTableRequest for table '{}' failed: {}",
+                        table_name,
+                        e
+                    );
+                    map.mark_retry_soon(&table_name, &compartment_id);
+                }
+            },
+            Err(e) => {
+                trace!(
+                    "rate limiter GetTableRequest for table '{}' failed: {}",
+                    table_name,
+                    e
+                );
+                map.mark_retry_soon(&table_name, &compartment_id);
+            }
+        }
+        map.finish_refresh(&table_name, &compartment_id);
+    }
+
+    pub(crate) fn update_rate_limiters(
+        &self,
+        table_name: &str,
+        compartment_id: &str,
+        limits: Option<&TableLimits>,
+    ) -> bool {
+        let Some(map) = &self.inner.rate_limiter_map else {
+            return false;
+        };
+        let compartment_id = self.effective_rate_limiter_compartment_id(compartment_id);
+        map.update(
+            table_name,
+            &compartment_id,
+            limits,
+            self.inner.builder.get_rate_limiting_percentage(),
+        )
+    }
+
+    fn effective_rate_limiter_compartment_id(&self, compartment_id: &str) -> String {
+        if !compartment_id.is_empty() {
+            return compartment_id.to_string();
+        }
+        self.inner.builder.default_compartment_id.clone()
+    }
+
+    fn duration_to_millis(duration: Duration) -> i64 {
+        duration.as_millis().min(i64::MAX as u128) as i64
+    }
+
     pub(crate) fn get_timeout(&self, t: &Option<Duration>) -> Duration {
         // if t is given, use that. If not, use handle's timeout
         if let Some(d) = t {
@@ -427,4 +882,62 @@ pub(crate) struct SendOptions {
     pub(crate) timeout: Duration,
     pub(crate) compartment_id: String,
     pub(crate) namespace: String,
+    pub(crate) table_name: String,
+    pub(crate) does_reads: bool,
+    pub(crate) does_writes: bool,
+    #[allow(dead_code)]
+    pub(crate) rate_limit_delayed_ms: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_map_keys_limiters_by_compartment() {
+        let map = RateLimiterMap::new();
+        let limits = TableLimits::provisioned(100, 200, 1);
+
+        assert!(map.update("Users", "compartment-a", Some(&limits), 100.0));
+        let compartment_a = map.get("users", "compartment-a").unwrap();
+        assert_eq!(compartment_a.read_units, 100.0);
+        assert_eq!(compartment_a.write_units, 200.0);
+
+        assert!(map.get("USERS", "compartment-a").is_some());
+        assert!(map.get("users", "compartment-b").is_none());
+        assert!(!map.needs_refresh("users", "compartment-a"));
+        assert!(map.needs_refresh("users", "compartment-b"));
+        map.mark_next_refresh("users", "compartment-a", Duration::ZERO);
+        assert!(map.get("users", "compartment-a").is_some());
+        assert!(map.needs_refresh("users", "compartment-a"));
+        assert!(map.try_start_refresh("users", "compartment-a"));
+        assert!(!map.try_start_refresh("users", "compartment-a"));
+        assert!(map.try_start_refresh("users", "compartment-b"));
+        map.finish_refresh("users", "compartment-a");
+        assert!(map.try_start_refresh("users", "compartment-a"));
+        map.finish_refresh("users", "compartment-a");
+        map.finish_refresh("users", "compartment-b");
+
+        assert!(map.update("users", "compartment-a", Some(&limits), 100.0));
+        let unchanged_compartment_a = map.get("users", "compartment-a").unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &compartment_a.read_limiter,
+            &unchanged_compartment_a.read_limiter
+        ));
+
+        let changed_limits = TableLimits::provisioned(101, 200, 1);
+        assert!(map.update("users", "compartment-a", Some(&changed_limits), 100.0));
+        let changed_compartment_a = map.get("users", "compartment-a").unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &compartment_a.read_limiter,
+            &changed_compartment_a.read_limiter
+        ));
+
+        assert!(map.update("users", "compartment-b", Some(&limits), 100.0));
+        let compartment_b = map.get("users", "compartment-b").unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &compartment_a.read_limiter,
+            &compartment_b.read_limiter
+        ));
+    }
 }

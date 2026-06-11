@@ -176,6 +176,12 @@ impl TableRequest {
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
         let resp = TableRequest::nson_deserialize(&mut r)?;
+        let table_name = if resp.table_name.is_empty() {
+            &self.table_name
+        } else {
+            &resp.table_name
+        };
+        h.update_rate_limiters(table_name, &self.compartment_id, resp.limits.as_ref());
         Ok(resp)
     }
 
@@ -324,6 +330,12 @@ impl GetTableRequest {
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
         let resp = TableRequest::nson_deserialize(&mut r)?;
+        let table_name = if resp.table_name.is_empty() {
+            &self.table_name
+        } else {
+            &resp.table_name
+        };
+        h.update_rate_limiters(table_name, &self.compartment_id, resp.limits.as_ref());
         Ok(resp)
     }
 
@@ -335,7 +347,9 @@ impl GetTableRequest {
 
         // payload
         ns.start_payload();
-        ns.write_string_field(OPERATION_ID, &self.operation_id);
+        if !self.operation_id.is_empty() {
+            ns.write_string_field(OPERATION_ID, &self.operation_id);
+        }
         // TODO: these are currently only in http headers. Add to NSON?
         //ns.write_string_field(COMPARTMENT_OCID, &self.compartment_id);
         //ns.write_string_field(NAMESPACE, &self.namespace);
