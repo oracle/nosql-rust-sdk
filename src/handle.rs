@@ -25,7 +25,7 @@ use crate::table_request::{GetTableRequest, TableRequest};
 use crate::types::{Capacity, TableLimits};
 use crate::writer::Writer;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::result::Result;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -70,13 +70,21 @@ pub(crate) struct HandleRef {
 struct RateLimiterEntry {
     read_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
     write_limiter: Arc<tokio::sync::Mutex<RateLimiter>>,
+    read_units: f64,
+    write_units: f64,
 }
 
 #[derive(Debug)]
 struct RateLimiterMap {
-    limiters: std::sync::Mutex<HashMap<String, RateLimiterEntry>>,
-    refresh_after: std::sync::Mutex<HashMap<String, Instant>>,
-    refresh_lock: tokio::sync::Mutex<()>,
+    limiters: std::sync::Mutex<HashMap<RateLimiterKey, RateLimiterEntry>>,
+    refresh_after: std::sync::Mutex<HashMap<RateLimiterKey, Instant>>,
+    refreshing: std::sync::Mutex<HashSet<RateLimiterKey>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RateLimiterKey {
+    table_name: String,
+    compartment_id: String,
 }
 
 impl RateLimiterEntry {
@@ -90,7 +98,13 @@ impl RateLimiterEntry {
                 write_units,
                 RATE_LIMITER_DURATION_SECS,
             ))),
+            read_units,
+            write_units,
         }
+    }
+
+    fn has_limits(&self, read_units: f64, write_units: f64) -> bool {
+        self.read_units == read_units && self.write_units == write_units
     }
 }
 
@@ -99,30 +113,33 @@ impl RateLimiterMap {
         RateLimiterMap {
             limiters: std::sync::Mutex::new(HashMap::new()),
             refresh_after: std::sync::Mutex::new(HashMap::new()),
-            refresh_lock: tokio::sync::Mutex::new(()),
+            refreshing: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
-    fn key(table_name: &str) -> String {
-        table_name.to_lowercase()
+    fn key(table_name: &str, compartment_id: &str) -> RateLimiterKey {
+        RateLimiterKey {
+            table_name: table_name.to_lowercase(),
+            compartment_id: compartment_id.to_string(),
+        }
     }
 
-    fn get(&self, table_name: &str) -> Option<RateLimiterEntry> {
+    fn get(&self, table_name: &str, compartment_id: &str) -> Option<RateLimiterEntry> {
         if table_name.is_empty() {
             return None;
         }
         self.limiters
             .lock()
             .unwrap()
-            .get(&Self::key(table_name))
+            .get(&Self::key(table_name, compartment_id))
             .cloned()
     }
 
-    fn needs_refresh(&self, table_name: &str) -> bool {
+    fn needs_refresh(&self, table_name: &str, compartment_id: &str) -> bool {
         if table_name.is_empty() {
             return false;
         }
-        let key = Self::key(table_name);
+        let key = Self::key(table_name, compartment_id);
         let guard = self.refresh_after.lock().unwrap();
         match guard.get(&key) {
             Some(refresh_after) => *refresh_after <= Instant::now(),
@@ -130,31 +147,57 @@ impl RateLimiterMap {
         }
     }
 
-    fn mark_refreshed(&self, table_name: &str) {
-        self.mark_next_refresh(table_name, RATE_LIMITER_REFRESH_INTERVAL);
+    fn mark_refreshed(&self, table_name: &str, compartment_id: &str) {
+        self.mark_next_refresh(table_name, compartment_id, RATE_LIMITER_REFRESH_INTERVAL);
     }
 
-    fn mark_retry_soon(&self, table_name: &str) {
-        self.mark_next_refresh(table_name, RATE_LIMITER_RETRY_INTERVAL);
+    fn mark_retry_soon(&self, table_name: &str, compartment_id: &str) {
+        self.mark_next_refresh(table_name, compartment_id, RATE_LIMITER_RETRY_INTERVAL);
     }
 
-    fn mark_next_refresh(&self, table_name: &str, delay: Duration) {
+    fn mark_next_refresh(&self, table_name: &str, compartment_id: &str, delay: Duration) {
         if table_name.is_empty() {
             return;
         }
-        self.refresh_after
-            .lock()
-            .unwrap()
-            .insert(Self::key(table_name), Instant::now() + delay);
+        self.refresh_after.lock().unwrap().insert(
+            Self::key(table_name, compartment_id),
+            Instant::now() + delay,
+        );
     }
 
-    fn update(&self, table_name: &str, limits: Option<&TableLimits>, percentage: f64) -> bool {
+    fn try_start_refresh(&self, table_name: &str, compartment_id: &str) -> bool {
         if table_name.is_empty() {
             return false;
         }
-        self.mark_refreshed(table_name);
+        self.refreshing
+            .lock()
+            .unwrap()
+            .insert(Self::key(table_name, compartment_id))
+    }
 
-        let key = Self::key(table_name);
+    fn finish_refresh(&self, table_name: &str, compartment_id: &str) {
+        if table_name.is_empty() {
+            return;
+        }
+        self.refreshing
+            .lock()
+            .unwrap()
+            .remove(&Self::key(table_name, compartment_id));
+    }
+
+    fn update(
+        &self,
+        table_name: &str,
+        compartment_id: &str,
+        limits: Option<&TableLimits>,
+        percentage: f64,
+    ) -> bool {
+        if table_name.is_empty() {
+            return false;
+        }
+        self.mark_refreshed(table_name, compartment_id);
+
+        let key = Self::key(table_name, compartment_id);
         let Some(limits) = limits else {
             self.limiters.lock().unwrap().remove(&key);
             return false;
@@ -167,10 +210,14 @@ impl RateLimiterMap {
 
         let read_units = (limits.read_units as f64 * percentage) / 100.0;
         let write_units = (limits.write_units as f64 * percentage) / 100.0;
-        self.limiters
-            .lock()
-            .unwrap()
-            .insert(key, RateLimiterEntry::new(read_units, write_units));
+        let mut guard = self.limiters.lock().unwrap();
+        if guard
+            .get(&key)
+            .is_some_and(|entry| entry.has_limits(read_units, write_units))
+        {
+            return true;
+        }
+        guard.insert(key, RateLimiterEntry::new(read_units, write_units));
         true
     }
 }
@@ -682,29 +729,68 @@ impl Handle {
         if table_name.is_empty() {
             return None;
         }
-        if let Some(entry) = map.get(table_name) {
+        let compartment_id = self.effective_rate_limiter_compartment_id(compartment_id);
+        if let Some(entry) = map.get(table_name, &compartment_id) {
+            if map.needs_refresh(table_name, &compartment_id) {
+                self.refresh_rate_limiter_in_background(
+                    table_name.to_string(),
+                    compartment_id.clone(),
+                    timeout,
+                );
+            }
             return Some(entry);
         }
-        if !map.needs_refresh(table_name) {
+
+        if !map.needs_refresh(table_name, &compartment_id) {
+            return None;
+        }
+        if !map.try_start_refresh(table_name, &compartment_id) {
             return None;
         }
 
-        let _guard = map.refresh_lock.lock().await;
-        if let Some(entry) = map.get(table_name) {
-            return Some(entry);
-        }
-        if !map.needs_refresh(table_name) {
-            return None;
+        self.refresh_rate_limiter(table_name.to_string(), compartment_id.clone(), timeout)
+            .await;
+        map.get(table_name, &compartment_id)
+    }
+
+    fn refresh_rate_limiter_in_background(
+        &self,
+        table_name: String,
+        compartment_id: String,
+        timeout: Duration,
+    ) {
+        let Some(map) = &self.inner.rate_limiter_map else {
+            return;
+        };
+        if !map.try_start_refresh(&table_name, &compartment_id) {
+            return;
         }
 
+        let handle = self.clone();
+        tokio::spawn(async move {
+            handle
+                .refresh_rate_limiter(table_name, compartment_id, timeout)
+                .await;
+        });
+    }
+
+    async fn refresh_rate_limiter(
+        &self,
+        table_name: String,
+        compartment_id: String,
+        timeout: Duration,
+    ) {
+        let Some(map) = &self.inner.rate_limiter_map else {
+            return;
+        };
         let metadata_timeout = if timeout < RATE_LIMITER_METADATA_TIMEOUT {
             timeout
         } else {
             RATE_LIMITER_METADATA_TIMEOUT
         };
-        let mut request = GetTableRequest::new(table_name).timeout(&metadata_timeout);
+        let mut request = GetTableRequest::new(&table_name).timeout(&metadata_timeout);
         if !compartment_id.is_empty() {
-            request = request.compartment_id(compartment_id);
+            request = request.compartment_id(&compartment_id);
         }
         let mut w: Writer = Writer::new();
         w.write_i16(self.inner.serial_version);
@@ -712,18 +798,22 @@ impl Handle {
         let mut opts = SendOptions {
             timeout: metadata_timeout,
             retryable: true,
-            compartment_id: compartment_id.to_string(),
+            compartment_id: compartment_id.clone(),
             ..Default::default()
         };
         match Box::pin(self.send_and_receive_without_rate_limiting(w, &mut opts)).await {
             Ok(mut r) => match TableRequest::nson_deserialize(&mut r) {
                 Ok(resp) => {
                     let result_table_name = if resp.table_name.is_empty() {
-                        table_name
+                        &table_name
                     } else {
                         &resp.table_name
                     };
-                    self.update_rate_limiters(result_table_name, resp.limits.as_ref());
+                    self.update_rate_limiters(
+                        result_table_name,
+                        &compartment_id,
+                        resp.limits.as_ref(),
+                    );
                 }
                 Err(e) => {
                     trace!(
@@ -731,7 +821,7 @@ impl Handle {
                         table_name,
                         e
                     );
-                    map.mark_retry_soon(table_name);
+                    map.mark_retry_soon(&table_name, &compartment_id);
                 }
             },
             Err(e) => {
@@ -740,26 +830,35 @@ impl Handle {
                     table_name,
                     e
                 );
-                map.mark_retry_soon(table_name);
+                map.mark_retry_soon(&table_name, &compartment_id);
             }
         }
-
-        map.get(table_name)
+        map.finish_refresh(&table_name, &compartment_id);
     }
 
     pub(crate) fn update_rate_limiters(
         &self,
         table_name: &str,
+        compartment_id: &str,
         limits: Option<&TableLimits>,
     ) -> bool {
         let Some(map) = &self.inner.rate_limiter_map else {
             return false;
         };
+        let compartment_id = self.effective_rate_limiter_compartment_id(compartment_id);
         map.update(
             table_name,
+            &compartment_id,
             limits,
             self.inner.builder.get_rate_limiting_percentage(),
         )
+    }
+
+    fn effective_rate_limiter_compartment_id(&self, compartment_id: &str) -> String {
+        if !compartment_id.is_empty() {
+            return compartment_id.to_string();
+        }
+        self.inner.builder.default_compartment_id.clone()
     }
 
     fn duration_to_millis(duration: Duration) -> i64 {
@@ -788,4 +887,57 @@ pub(crate) struct SendOptions {
     pub(crate) does_writes: bool,
     #[allow(dead_code)]
     pub(crate) rate_limit_delayed_ms: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_map_keys_limiters_by_compartment() {
+        let map = RateLimiterMap::new();
+        let limits = TableLimits::provisioned(100, 200, 1);
+
+        assert!(map.update("Users", "compartment-a", Some(&limits), 100.0));
+        let compartment_a = map.get("users", "compartment-a").unwrap();
+        assert_eq!(compartment_a.read_units, 100.0);
+        assert_eq!(compartment_a.write_units, 200.0);
+
+        assert!(map.get("USERS", "compartment-a").is_some());
+        assert!(map.get("users", "compartment-b").is_none());
+        assert!(!map.needs_refresh("users", "compartment-a"));
+        assert!(map.needs_refresh("users", "compartment-b"));
+        map.mark_next_refresh("users", "compartment-a", Duration::ZERO);
+        assert!(map.get("users", "compartment-a").is_some());
+        assert!(map.needs_refresh("users", "compartment-a"));
+        assert!(map.try_start_refresh("users", "compartment-a"));
+        assert!(!map.try_start_refresh("users", "compartment-a"));
+        assert!(map.try_start_refresh("users", "compartment-b"));
+        map.finish_refresh("users", "compartment-a");
+        assert!(map.try_start_refresh("users", "compartment-a"));
+        map.finish_refresh("users", "compartment-a");
+        map.finish_refresh("users", "compartment-b");
+
+        assert!(map.update("users", "compartment-a", Some(&limits), 100.0));
+        let unchanged_compartment_a = map.get("users", "compartment-a").unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &compartment_a.read_limiter,
+            &unchanged_compartment_a.read_limiter
+        ));
+
+        let changed_limits = TableLimits::provisioned(101, 200, 1);
+        assert!(map.update("users", "compartment-a", Some(&changed_limits), 100.0));
+        let changed_compartment_a = map.get("users", "compartment-a").unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &compartment_a.read_limiter,
+            &changed_compartment_a.read_limiter
+        ));
+
+        assert!(map.update("users", "compartment-b", Some(&limits), 100.0));
+        let compartment_b = map.get("users", "compartment-b").unwrap();
+        assert!(!std::sync::Arc::ptr_eq(
+            &compartment_a.read_limiter,
+            &compartment_b.read_limiter
+        ));
+    }
 }
