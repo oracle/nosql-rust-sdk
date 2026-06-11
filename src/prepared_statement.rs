@@ -11,6 +11,8 @@ use crate::types::{FieldValue, TopologyInfo};
 use std::collections::HashMap;
 use std::result::Result;
 
+const OPCODE_SELECT: u8 = 5;
+
 /// A prepared query statement for use in a [`QueryRequest`](crate::QueryRequest).
 ///
 /// PreparedStatement encapsulates a prepared query statement. It includes state
@@ -86,6 +88,10 @@ pub struct PreparedStatement {
     // every time a new batch of results is needed.
     pub(crate) statement: Vec<u8>,
 
+    // Query protocol v6 returns prepared query blobs by branch. Non-UNION
+    // queries have a single branch; UNION queries have one per branch.
+    pub(crate) branches: Vec<PreparedStatementBranch>,
+
     // variable_to_ids maps the name of each external variable to its id, which is
     // a position in a FieldValue array stored in the QueryRequest and
     // holding the values of the variables.
@@ -98,6 +104,13 @@ pub struct PreparedStatement {
     pub(crate) num_iterators: i32,
 
     pub(crate) data: PreparedStatementData,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PreparedStatementBranch {
+    pub(crate) statement: Vec<u8>,
+    pub(crate) table_name: Option<String>,
+    pub(crate) namespace: Option<String>,
 }
 
 impl std::fmt::Debug for PreparedStatement {
@@ -144,6 +157,9 @@ impl PreparedStatement {
     pub(crate) fn is_empty(&self) -> bool {
         self.statement.len() == 0
     }
+    pub(crate) fn does_writes(&self) -> bool {
+        !self.is_empty() && self.operation != OPCODE_SELECT
+    }
     // set iterators/etc to their initial values, as if
     // they had just been deserialized
     pub(crate) fn reset(&mut self) -> Result<(), NoSQLError> {
@@ -152,15 +168,36 @@ impl PreparedStatement {
         //self.data = PreparedStatementData::default();
         Ok(())
     }
-    pub(crate) fn copy_for_internal(&self) -> Self {
+    pub(crate) fn copy_for_internal(&self, branch_index: Option<usize>) -> Self {
         let mut data = PreparedStatementData::default();
         for (k, v) in &self.data.bind_variables {
             data.bind_variables.insert(k.clone(), v.clone_internal());
         }
+
+        let (statement, table_name, namespace) = if let Some(index) = branch_index {
+            let branch = self
+                .branches
+                .get(index)
+                .unwrap_or_else(|| panic!("missing prepared query branch {}", index));
+            (
+                branch.statement.clone(),
+                branch.table_name.clone(),
+                branch.namespace.clone(),
+            )
+        } else {
+            (
+                self.statement.clone(),
+                self.table_name.clone(),
+                self.namespace.clone(),
+            )
+        };
+
         PreparedStatement {
-            // we only keep the actual binary prepared statement, all other
-            // fields get their defaults
-            statement: self.statement.clone(),
+            // Keep the binary statement plus metadata needed for rate limiting.
+            statement,
+            table_name,
+            namespace,
+            operation: self.operation,
             data: data,
             ..Default::default()
         }

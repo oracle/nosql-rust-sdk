@@ -97,6 +97,7 @@ pub const QUERY_OPERATION: &str = "qo";
 pub const QUERY_PLAN_STRING: &str = "qs";
 pub const QUERY_RESULTS: &str = "qr";
 pub const QUERY_RESULT_SCHEMA: &str = "qc";
+pub const QUERY_BRANCHES: &str = "qb";
 pub const QUERY_VERSION: &str = "qv";
 pub const RANGE: &str = "rg";
 pub const RANGE_PATH: &str = "rp";
@@ -154,6 +155,9 @@ pub trait NsonRequest {
 
 pub trait NsonSubRequest: std::fmt::Debug {
     fn serialize(&self, w: &mut Writer, timeout: &Duration);
+    fn does_reads(&self) -> bool {
+        false
+    }
 }
 
 // The base struct used for all serialization.
@@ -353,6 +357,7 @@ impl<'a> NsonSerializer<'a> {
             self.write_string_field(TABLE_NAME, table_name);
         }
         self.write_i32_field(OP_CODE, op_code as i32);
+        self.write_i32_field(TOPO_SEQ_NUM, -1);
         self.write_i32_field(TIMEOUT, timeout.as_millis() as i32);
     }
 

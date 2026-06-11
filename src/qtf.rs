@@ -26,6 +26,10 @@ use bigdecimal::{BigDecimal, Num};
 use serde_json::Value;
 //use tracing::debug;
 
+const QTF_NAN_SENTINEL: &str = "\u{0}qtf_nan";
+const QTF_INF_SENTINEL: &str = "\u{0}qtf_inf";
+const QTF_NEG_INF_SENTINEL: &str = "\u{0}qtf_neg_inf";
+
 // TestSuite represents a query test suite used to test a specific functionality
 // and usually contains multiple query test cases.
 //
@@ -171,7 +175,7 @@ impl TestSuite {
         };
 
         let test_case_file = sjoin(&self.test_case_dir, &name);
-        tc.query_stmts = read_lines_from_file(&test_case_file, true, true)?.join(" ");
+        tc.query_stmts = read_query_lines_from_file(&test_case_file)?.join(" ");
 
         let result_type = results.pop_front().unwrap().to_lowercase();
 
@@ -678,14 +682,8 @@ pub fn read_data_file(file: &str) -> Result<HashMap<String, Vec<MapValue>>, Box<
         // if the concatenation of previous lines is a valid JSON object,
         // we have read a complete record data.
         if cnt == 0 {
-            //let v: Value = serde_json::from_str(&b)?;
-            //if let Ok(v) = serde_json::from_str(&b) {
-            match serde_json::from_str(&b) {
-                Ok(v) => {
-                    let val = MapValue::from_json_object(&v)?;
-                    //debug!("read value from json: {:?}", val);
-                    values.push(val);
-                }
+            match qtf_json_to_map_value(&b) {
+                Ok(val) => values.push(val),
                 Err(e) => {
                     println!(
                         "WARN: error converting expected value to json in {} record {}: {e}",
@@ -789,6 +787,198 @@ fn read_lines_from_file_inner(
     //BufReader::new(File::open(filename)?).lines().collect()
 }
 
+pub(crate) fn qtf_json_to_map_value(json: &str) -> Result<MapValue, Box<dyn Error>> {
+    let normalized_json = normalize_qtf_json(json);
+    let v: Value = serde_json::from_str(&normalized_json)?;
+    qtf_json_value_to_map_value(&v)
+}
+
+fn normalize_qtf_json(json: &str) -> String {
+    let bytes = json.as_bytes();
+    let mut out = String::with_capacity(json.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+
+        if qtf_json_token_at(json, i, "-Infinity") {
+            out.push_str("\"\\u0000qtf_neg_inf\"");
+            i += "-Infinity".len();
+            continue;
+        }
+
+        if qtf_json_token_at(json, i, "Infinity") {
+            out.push_str("\"\\u0000qtf_inf\"");
+            i += "Infinity".len();
+            continue;
+        }
+
+        if qtf_json_token_at(json, i, "NaN") {
+            out.push_str("\"\\u0000qtf_nan\"");
+            i += "NaN".len();
+            continue;
+        }
+
+        out.push(c);
+        i += 1;
+    }
+
+    out
+}
+
+fn qtf_json_token_at(json: &str, pos: usize, token: &str) -> bool {
+    if !json[pos..].starts_with(token) {
+        return false;
+    }
+
+    let bytes = json.as_bytes();
+    let before = if pos == 0 { None } else { Some(bytes[pos - 1]) };
+    let after_pos = pos + token.len();
+    let after = if after_pos >= bytes.len() {
+        None
+    } else {
+        Some(bytes[after_pos])
+    };
+
+    qtf_json_token_boundary(before) && qtf_json_token_boundary(after)
+}
+
+fn qtf_json_token_boundary(c: Option<u8>) -> bool {
+    match c {
+        None => true,
+        Some(c) => !c.is_ascii_alphanumeric() && c != b'_',
+    }
+}
+
+fn qtf_json_value_to_map_value(json: &Value) -> Result<MapValue, Box<dyn Error>> {
+    if let Value::Object(o) = json {
+        let mut mv = MapValue::new();
+        for (key, val) in o {
+            mv.put_field_value(key, qtf_json_value_to_field_value(val));
+        }
+        return Ok(mv);
+    }
+    Err(format!("from_json_object: json value is not an Object: {:#?}", json).into())
+}
+
+fn qtf_json_value_to_field_value(json: &Value) -> FieldValue {
+    match json {
+        Value::String(s) if s == QTF_NAN_SENTINEL => FieldValue::Double(f64::NAN),
+        Value::String(s) if s == QTF_INF_SENTINEL => FieldValue::Double(f64::INFINITY),
+        Value::String(s) if s == QTF_NEG_INF_SENTINEL => FieldValue::Double(f64::NEG_INFINITY),
+        Value::Number(n) => qtf_json_number_to_field_value(n),
+        Value::Null => FieldValue::JsonNull,
+        Value::Array(a) => FieldValue::Array(a.iter().map(qtf_json_value_to_field_value).collect()),
+        Value::Object(_) => FieldValue::Map(qtf_json_value_to_map_value(json).unwrap()),
+        _ => json.to_field_value(),
+    }
+}
+
+fn qtf_json_number_to_field_value(n: &serde_json::Number) -> FieldValue {
+    if n.is_i64() {
+        let nv64 = n.as_i64().unwrap();
+        if let Ok(nv32) = i32::try_from(nv64) {
+            return FieldValue::Integer(nv32);
+        }
+        return FieldValue::Long(nv64);
+    }
+
+    let number_text = n.to_string();
+    if n.is_f64() {
+        let f = n.as_f64().unwrap();
+        if !qtf_number_underflowed_to_zero(f, &number_text) {
+            return FieldValue::Double(f);
+        }
+    }
+
+    if let Ok(bd) = BigDecimal::from_str_radix(&number_text, 10) {
+        return FieldValue::Number(bd);
+    }
+
+    FieldValue::String(number_text)
+}
+
+fn qtf_number_underflowed_to_zero(f: f64, number_text: &str) -> bool {
+    if f != 0.0 {
+        return false;
+    }
+
+    match BigDecimal::from_str_radix(number_text, 10) {
+        Ok(bd) => bd != BigDecimal::default(),
+        Err(_) => false,
+    }
+}
+
+fn read_query_lines_from_file(filename: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut lines = read_lines_from_file(filename, true, true)?;
+    lines = lines
+        .into_iter()
+        .filter_map(|mut line| {
+            strip_inline_hash_comment(&mut line);
+            if line.trim().is_empty() {
+                None
+            } else {
+                Some(line)
+            }
+        })
+        .collect();
+    Ok(lines)
+}
+
+fn strip_inline_hash_comment(line: &mut String) {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    for (idx, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        if c == '\\' && (in_single_quote || in_double_quote) {
+            escaped = true;
+            continue;
+        }
+
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+
+        if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+
+        if c == '#' && !in_single_quote && !in_double_quote {
+            line.truncate(idx);
+            break;
+        }
+    }
+}
+
 // read_blocks_from_file reads contents in blocks from the specified file.
 // a block of content ends with an empty line.
 pub fn read_blocks_from_file(filename: &str) -> Result<Vec<String>, Box<dyn Error>> {
@@ -868,7 +1058,7 @@ pub struct Random {
     seed: i64,
 }
 
-const MULTIPLIER: i64 = 0x5DFFCE66D;
+const MULTIPLIER: i64 = 0x5DEECE66D;
 const ADDEND: i64 = 0xB;
 const MASK: i64 = (1 << 48) - 1;
 
@@ -883,17 +1073,18 @@ impl Random {
     // next_int returns a pseudorandom, uniformly distributed i32 value
     // between 0 (inclusive) and the specified value (exclusive).
     pub fn next_int(&mut self, bound: i32) -> i32 {
+        assert!(bound > 0, "bound must be positive");
         let mut x = self.next(31);
         let m = bound - 1;
-        // n is a power of 2
-        if bound % m == 0 {
+        // bound is a power of 2
+        if bound & m == 0 {
             return ((bound as i64 * x as i64) >> 31) as i32;
         }
 
         let mut u = x;
         loop {
             x = u % bound;
-            if u - x + m >= 0 {
+            if u.wrapping_sub(x).wrapping_add(m) >= 0 {
                 break;
             }
             u = self.next(31);
@@ -908,6 +1099,54 @@ impl Random {
         self.seed = nextseed;
 
         return (nextseed >> (48 - bits as u32)) as i32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{qtf_json_to_map_value, strip_inline_hash_comment, Random};
+    use crate::types::FieldValue;
+
+    #[test]
+    fn random_matches_java_next_int_sequences() {
+        let mut r = Random::new(1);
+        let values: Vec<i32> = (0..12).map(|_| r.next_int(20)).collect();
+        assert_eq!(values, vec![5, 8, 7, 13, 14, 4, 14, 6, 18, 8, 9, 13]);
+
+        let mut r = Random::new(1);
+        let values: Vec<i32> = (0..18).map(|_| r.next_int(5)).collect();
+        assert_eq!(
+            values,
+            vec![0, 3, 2, 3, 4, 4, 4, 1, 3, 3, 4, 3, 2, 3, 2, 4, 2, 2]
+        );
+
+        let mut r = Random::new(1);
+        let values: Vec<i32> = (0..12).map(|_| r.next_int(4)).collect();
+        assert_eq!(values, vec![2, 0, 1, 1, 0, 0, 1, 2, 3, 2, 0, 0]);
+    }
+
+    #[test]
+    fn query_hash_comments_are_stripped_outside_strings() {
+        let mut line = "select '#kept' as s, \"#also_kept\" as d # removed".to_string();
+        strip_inline_hash_comment(&mut line);
+        assert_eq!(line, "select '#kept' as s, \"#also_kept\" as d ");
+
+        let mut line = "  # whole-line comment".to_string();
+        strip_inline_hash_comment(&mut line);
+        assert_eq!(line, "  ");
+    }
+
+    #[test]
+    fn qtf_json_preserves_nonzero_numbers_that_underflow_f64() {
+        let mv = qtf_json_to_map_value(r#"{"n":4.9334E-325,"d":4.9E-324}"#).unwrap();
+        match mv.get_field_value("n").unwrap() {
+            FieldValue::Number(n) => assert_eq!(n.to_string(), "4.9334E-325"),
+            v => panic!("expected NUMBER for underflowing value, got {:?}", v),
+        }
+        match mv.get_field_value("d").unwrap() {
+            FieldValue::Double(d) => assert_eq!(*d, 5e-324),
+            v => panic!("expected DOUBLE for f64 min subnormal value, got {:?}", v),
+        }
     }
 }
 

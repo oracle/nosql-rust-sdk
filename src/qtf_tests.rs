@@ -4,7 +4,7 @@
 // Licensed under the Universal Permissive License v 1.0 as shown at
 //  https://oss.oracle.com/licenses/upl/
 //
-use crate::qtf::{TestCase, TestRunner, TestSuite};
+use crate::qtf::{qtf_json_to_map_value, TestCase, TestRunner, TestSuite};
 use crate::rate_limiter::RateLimiter;
 use crate::sort_iter::SortSpec;
 use crate::types::*;
@@ -17,7 +17,6 @@ use crate::SystemRequest;
 use crate::TableRequest;
 use async_recursion::async_recursion;
 use core::cmp::Ordering;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
 use std::time::Duration;
@@ -34,6 +33,7 @@ async fn get_handle() -> Result<Handle, NoSQLError> {
         .endpoint("http://localhost:8080")?
         .mode(HandleMode::Cloudsim)?
         .timeout(Duration::new(30, 0))?
+        .rate_limiting_enabled(true)?
         //.cloud_auth_from_file("~/.oci/config")?
         .from_environment()?
         .build()
@@ -326,9 +326,7 @@ async fn clean_up(
 }
 
 fn json_to_map_value(json: &str) -> Result<MapValue, Box<dyn Error>> {
-    let v: Value = serde_json::from_str(json)?;
-    let mv = MapValue::from_json_object(&v)?;
-    Ok(mv)
+    qtf_json_to_map_value(json)
 }
 
 fn compare_map_values(mv1: &MapValue, mv2: &MapValue, nulls_equal: bool) -> Ordering {
@@ -723,4 +721,31 @@ async fn execute_table_ddl(
         .wait_for_completion_ms(handle, 30000, 200)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compare_map_values, json_to_map_value};
+    use crate::types::{FieldValue, MapValue};
+    use core::cmp::Ordering;
+
+    #[test]
+    fn qtf_expected_json_accepts_special_float_literals() {
+        let expected = json_to_map_value(
+            r#"{"nan":NaN,"inf":Infinity,"neg":-Infinity,"arr":[NaN],"s":"NaN"}"#,
+        )
+        .unwrap();
+
+        let mut actual = MapValue::new();
+        actual.put_field_value("arr", FieldValue::Array(vec![FieldValue::Double(f64::NAN)]));
+        actual.put_field_value("inf", FieldValue::Double(f64::INFINITY));
+        actual.put_field_value("nan", FieldValue::Double(f64::NAN));
+        actual.put_field_value("neg", FieldValue::Double(f64::NEG_INFINITY));
+        actual.put_field_value("s", FieldValue::String("NaN".to_string()));
+
+        assert_eq!(
+            compare_map_values(&expected, &actual, true),
+            Ordering::Equal
+        );
+    }
 }

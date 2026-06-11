@@ -52,6 +52,8 @@ pub struct HandleBuilder {
     // For error messaging
     pub(crate) from_environment: bool,
     pub(crate) default_compartment_id: String,
+    pub(crate) rate_limiting_enabled: bool,
+    pub(crate) default_rate_limiter_percentage: f64,
 }
 
 impl fmt::Debug for HandleBuilder {
@@ -439,6 +441,38 @@ impl HandleBuilder {
         self.default_compartment_id = compartment_id.to_string();
         Ok(self)
     }
+
+    /// Cloud Service only: enable or disable internal rate limiting.
+    ///
+    /// When enabled, the handle maintains table-scoped read and write rate limiters based on
+    /// the table limits returned by `GetTableRequest` or `TableRequest`.
+    ///
+    /// Rate limiting is disabled by default.
+    pub fn rate_limiting_enabled(mut self, enabled: bool) -> Result<Self, NoSQLError> {
+        self.rate_limiting_enabled = enabled;
+        Ok(self)
+    }
+
+    /// Cloud Service only: set the percentage of table limits this handle should use.
+    ///
+    /// This only applies when [`rate_limiting_enabled()`](HandleBuilder::rate_limiting_enabled)
+    /// is set to `true`. The default is 100.0, which allows this handle to consume the full
+    /// table limits.
+    pub fn rate_limiting_percentage(mut self, percentage: f64) -> Result<Self, NoSQLError> {
+        if percentage <= 0.0 || !percentage.is_finite() {
+            return ia_err!("rate limiting percentage must be positive");
+        }
+        self.default_rate_limiter_percentage = percentage;
+        Ok(self)
+    }
+
+    pub(crate) fn get_rate_limiting_percentage(&self) -> f64 {
+        if self.default_rate_limiter_percentage == 0.0 {
+            return 100.0;
+        }
+        self.default_rate_limiter_percentage
+    }
+
     /// Specify credentials for use with a secure On-premises NoSQL Server.
     ///
     /// When using a secure server, a username and password are required. Use this method

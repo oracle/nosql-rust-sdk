@@ -474,11 +474,15 @@ pub(crate) mod handle;
 pub use crate::handle::Handle;
 
 pub(crate) mod aggr_iter;
+pub(crate) mod and_or_iter;
 pub(crate) mod arith_op_iter;
+pub(crate) mod array_constr_iter;
 pub(crate) mod auth_common;
 pub use crate::auth_common::authentication_provider::AuthenticationProvider;
 
+pub(crate) mod case_iter;
 pub(crate) mod collect_iter;
+pub(crate) mod comp_op_iter;
 pub(crate) mod const_iter;
 pub(crate) mod delete_request;
 pub use crate::delete_request::{DeleteRequest, DeleteResult};
@@ -495,6 +499,7 @@ pub(crate) mod get_request;
 pub use crate::get_request::{GetRequest, GetResult};
 
 pub(crate) mod group_iter;
+pub(crate) mod is_null_iter;
 pub(crate) mod list_tables_request;
 pub use crate::list_tables_request::{ListTablesRequest, ListTablesResult};
 
@@ -529,6 +534,7 @@ pub(crate) mod region;
 pub(crate) mod request_tests;
 #[cfg(test)]
 pub(crate) mod rw_tests;
+pub(crate) mod seq_aggr_iter;
 pub(crate) mod sfw_iter;
 pub(crate) mod size_iter;
 pub(crate) mod sort_iter;
@@ -543,6 +549,7 @@ pub use crate::table_usage_request::{TableUsage, TableUsageRequest, TableUsageRe
 
 pub mod rate_limiter;
 pub mod types;
+pub(crate) mod union_iter;
 /// Type representing a specific version of a table row in the NoSQL Database.
 pub type Version = Vec<u8>;
 pub use crate::types::NoSQLColumnToFieldValue;

@@ -26,7 +26,7 @@ serde = "1.0.200"
 serde_derive = "1.0.200"
 dirs = "5.0.1"
 serde_json = { version = "1.0.128", features = ["arbitrary_precision"] }
-bigdecimal = "0.4.5"
+bigdecimal = "0.4.6"
 derive_builder = { version = "0.20.0" }
 oracle-nosql-rust-sdk-derive = { version = "0.1" }
 async-recursion = "1.1.1"

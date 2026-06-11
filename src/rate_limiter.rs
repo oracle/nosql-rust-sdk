@@ -81,7 +81,8 @@ impl RateLimiter {
     }
 
     pub fn set_duration(&mut self, duration_secs: f64) {
-        self.duration_nanos = (1_000_000_000.0 / duration_secs) as i64;
+        self.duration_nanos = (duration_secs * 1_000_000_000.0) as i64;
+        self.enforce_minimum_duration();
     }
 
     fn enforce_minimum_duration(&mut self) {
@@ -103,6 +104,26 @@ impl RateLimiter {
         self.last_nano = RateLimiter::nano_time();
     }
 
+    pub(crate) fn reserve_units_with_timeout(
+        &mut self,
+        units: i64,
+        timeout_ms: i64,
+        always_consume: bool,
+    ) -> Result<i64, String> {
+        if timeout_ms < 0 {
+            return Err("timeout_ms must not be negative".to_string());
+        }
+        let ms_to_sleep =
+            self.consume_internal(units, timeout_ms, always_consume, RateLimiter::nano_time());
+        if ms_to_sleep == 0 {
+            return Ok(0);
+        }
+        if timeout_ms > 0 && ms_to_sleep >= timeout_ms {
+            return Err("consume timed out".to_string());
+        }
+        Ok(ms_to_sleep)
+    }
+
     pub async fn consume_units_with_timeout(
         &mut self,
         units: i64,
@@ -117,8 +138,8 @@ impl RateLimiter {
         if ms_to_sleep == 0 {
             return Ok(0);
         }
-        if timeout_ms > 0 && ms_to_sleep > timeout_ms {
-            tokio::time::sleep(Duration::from_millis(ms_to_sleep as u64)).await;
+        if timeout_ms > 0 && ms_to_sleep >= timeout_ms {
+            tokio::time::sleep(Duration::from_millis(timeout_ms as u64)).await;
             return Err("consume timed out".into());
         }
         tokio::time::sleep(Duration::from_millis(ms_to_sleep as u64)).await;
@@ -194,5 +215,27 @@ impl RateLimiter {
         }
 
         sleep_ms
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RateLimiter;
+
+    #[test]
+    fn duration_is_seconds() {
+        let rl = RateLimiter::new_with_duration(100.0, 30.0);
+
+        assert_eq!(rl.duration_nanos, 30_000_000_000);
+    }
+
+    #[test]
+    fn reserve_timeout_does_not_consume_units() {
+        let mut rl = RateLimiter::new_with_duration(1.0, 1.0);
+        rl.last_nano = RateLimiter::nano_time() + 50_000_000;
+        let before = rl.last_nano;
+
+        assert!(rl.reserve_units_with_timeout(1, 10, false).is_err());
+        assert_eq!(rl.last_nano, before);
     }
 }

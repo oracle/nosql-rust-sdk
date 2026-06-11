@@ -584,6 +584,23 @@ struct ComplexData {
     pub data: Option<ComplexA>,
 }
 
+#[derive(Default, Debug, Clone, NoSQLRow)]
+struct JsonPortionA {
+    #[nosql(column=fielda)]
+    pub a: i64,
+    #[nosql(column=fieldb)]
+    pub b: String,
+}
+
+#[derive(Default, Debug, NoSQLRow)]
+struct JsonCollectionData {
+    pub id: i64,
+    #[nosql(column=portiona)]
+    pub a: Vec<JsonPortionA>,
+    #[nosql(column=portionb)]
+    pub b: Vec<PortionB>,
+}
+
 #[tokio::test]
 async fn complex_json_test2() -> Result<(), Box<dyn Error>> {
     let handle = get_builder()?.build().await?;
@@ -660,11 +677,10 @@ async fn json_collection_test() -> Result<(), Box<dyn Error>> {
         .wait_for_completion_ms(&handle, 15000, 500)
         .await?;
 
-    let mut portion_a: Vec<PortionA> = Vec::new();
-    portion_a.push(PortionA {
+    let mut portion_a: Vec<JsonPortionA> = Vec::new();
+    portion_a.push(JsonPortionA {
         a: 1000,
         b: "testing".to_string(),
-        c: None,
     });
     let mut portion_b: Vec<PortionB> = Vec::new();
     portion_b.push(PortionB {
@@ -677,7 +693,7 @@ async fn json_collection_test() -> Result<(), Box<dyn Error>> {
         y: Some("foo".to_string()),
         z: vec![27, 59],
     });
-    let data = ComplexA {
+    let data = JsonCollectionData {
         id: 100,
         a: portion_a.clone(),
         b: portion_b.clone(),
@@ -689,7 +705,7 @@ async fn json_collection_test() -> Result<(), Box<dyn Error>> {
         .await;
     println!("put result={:?}", res);
 
-    let mut a = ComplexA {
+    let mut a = JsonCollectionData {
         id: 100,
         ..Default::default()
     };

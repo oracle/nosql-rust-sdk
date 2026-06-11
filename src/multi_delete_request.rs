@@ -200,10 +200,17 @@ impl MultiDeleteRequest {
             timeout: timeout,
             retryable: false,
             compartment_id: self.compartment_id.clone(),
+            table_name: self.table_name.clone(),
+            does_reads: true,
+            does_writes: true,
             ..Default::default()
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
         let resp = MultiDeleteRequest::nson_deserialize(&mut r)?;
+        if let Some(consumed) = resp.consumed.as_ref() {
+            h.consume_rate_limited_capacity(&mut opts, &self.table_name, consumed)
+                .await;
+        }
         Ok(resp)
     }
 
