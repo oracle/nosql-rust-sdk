@@ -9,16 +9,29 @@ use crate::auth_common::private_key_supplier::Supplier;
 use openssl::pkey::Private;
 use openssl::rsa::Rsa;
 use std::error::Error;
+use std::fmt;
 
 /// An authentication details provider that contains user authentication information and region information.
 /// This is an ideal provider to be used if customer authentication information is not read from config file.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SimpleAuthenticationProvider {
     tenancy_id: String,
     user_id: String,
     fingerprint: String,
     region_id: String,
     supplier: Box<dyn Supplier>,
+}
+
+impl fmt::Debug for SimpleAuthenticationProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SimpleAuthenticationProvider")
+            .field("tenancy_id", &self.tenancy_id)
+            .field("user_id", &self.user_id)
+            .field("fingerprint", &self.fingerprint)
+            .field("region_id", &self.region_id)
+            .field("supplier", &"[redacted]")
+            .finish()
+    }
 }
 
 impl SimpleAuthenticationProvider {
@@ -68,5 +81,35 @@ impl AuthenticationProvider for SimpleAuthenticationProvider {
     }
     fn region_id(&self) -> &str {
         &self.region_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    struct TestSupplier;
+
+    impl Supplier for TestSupplier {
+        fn get_key(&self) -> Result<Rsa<Private>, Box<dyn Error>> {
+            unreachable!("debug formatting must not request private keys")
+        }
+    }
+
+    #[test]
+    fn debug_redacts_private_key_supplier() {
+        let provider = SimpleAuthenticationProvider::new(
+            "tenancy".to_string(),
+            "user".to_string(),
+            "fingerprint".to_string(),
+            "region".to_string(),
+            Box::new(TestSupplier),
+        );
+
+        let debug = format!("{:?}", provider);
+
+        assert!(!debug.contains("TestSupplier"));
+        assert!(debug.contains("[redacted]"));
     }
 }

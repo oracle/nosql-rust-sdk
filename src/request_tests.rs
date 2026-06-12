@@ -5,9 +5,16 @@
 //  https://oss.oracle.com/licenses/upl/
 //
 use crate::get_request::*;
+use crate::multi_delete_request::*;
 use crate::put_request::*;
-use crate::reader::Reader;
+use crate::system_request::*;
+use crate::{nson::*, reader::Reader, types::*, writer::Writer};
 use std::error::Error;
+use std::time::Duration;
+
+fn do_serialize(r: &dyn NsonRequest, w: &mut Writer, timeout: &Duration) {
+    r.serialize(w, timeout);
+}
 
 #[test]
 fn test_get_result() -> Result<(), Box<dyn Error>> {
@@ -63,5 +70,68 @@ fn test_put_result() -> Result<(), Box<dyn Error>> {
     let mut r1 = Reader::new().from_bytes(&bytes1);
     let resp1 = PutRequest::nson_deserialize(&mut r1)?;
     println!("PutResult: cons={:?}", resp1.consumed);
+    Ok(())
+}
+
+#[test]
+fn test_multi_delete_request_field_range() -> Result<(), Box<dyn Error>> {
+    let timeout = Duration::from_millis(30000);
+    let partial_key = FieldValue::Map(MapValue::new().i32("account_id", 1));
+    let range = FieldRange {
+        field_path: "user_id".to_string(),
+        start: Some(FieldValue::Integer(10)),
+        start_inclusive: true,
+        end: Some(FieldValue::Integer(20)),
+        end_inclusive: false,
+    };
+    let r = MultiDeleteRequest::new("testusers", &partial_key).field_range(range);
+    let mut w: Writer = Writer::new();
+    do_serialize(&r, &mut w, &timeout);
+
+    let mut reader = Reader::new().from_bytes(w.bytes());
+    let request = reader.read_field_value()?.get_map_value()?;
+    let payload = request.get_map(PAYLOAD).ok_or("payload missing")?;
+    let range = payload.get_map(RANGE).ok_or("range missing")?;
+
+    assert_eq!(range.get_string(RANGE_PATH), Some("user_id".to_string()));
+    assert!(range.get_field_value(VALUE).is_none());
+    assert!(range.get_field_value(INCLUSIVE).is_none());
+
+    let start = range.get_map(START).ok_or("range start missing")?;
+    assert_eq!(start.get_i32(VALUE), Some(10));
+    assert_eq!(start.get_bool(INCLUSIVE), Some(true));
+
+    let end = range.get_map(END).ok_or("range end missing")?;
+    assert_eq!(end.get_i32(VALUE), Some(20));
+    assert_eq!(end.get_bool(INCLUSIVE), Some(false));
+
+    Ok(())
+}
+
+fn serialized_op_code(r: &dyn NsonRequest, timeout: &Duration) -> Result<i32, Box<dyn Error>> {
+    let mut w = Writer::new();
+    do_serialize(r, &mut w, timeout);
+
+    let mut reader = Reader::new().from_bytes(w.bytes());
+    let request = reader.read_field_value()?.get_map_value()?;
+    let header = request.get_map(HEADER).ok_or("header missing")?;
+    header.get_i32(OP_CODE).ok_or("op code missing".into())
+}
+
+#[test]
+fn test_system_request_op_codes() -> Result<(), Box<dyn Error>> {
+    let timeout = Duration::from_millis(30000);
+
+    assert_eq!(OpCode::CreateIndex as i32, 21);
+    assert_eq!(OpCode::DropIndex as i32, 22);
+    assert_eq!(OpCode::SystemRequest as i32, 23);
+    assert_eq!(OpCode::SystemStatusRequest as i32, 24);
+
+    let request = SystemRequest::new("CREATE NAMESPACE ns1");
+    assert_eq!(serialized_op_code(&request, &timeout)?, 23);
+
+    let status_request = SystemStatusRequest::new("operation-1");
+    assert_eq!(serialized_op_code(&status_request, &timeout)?, 24);
+
     Ok(())
 }

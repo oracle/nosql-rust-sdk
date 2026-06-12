@@ -26,6 +26,7 @@ use oracle_nosql_rust_sdk::WriteMultipleRequest;
 use std::collections::HashMap;
 use std::error::Error;
 use std::time::Duration;
+use std::time::SystemTime;
 
 fn get_builder() -> Result<HandleBuilder, NoSQLError> {
     Handle::builder()
@@ -39,6 +40,14 @@ fn get_builder() -> Result<HandleBuilder, NoSQLError> {
         //.cloud_auth_from_instance()
         // this will override any defaults above
         .from_environment()
+}
+
+fn unique_table_name(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{}_{}_{}", prefix, std::process::id(), nanos)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -202,6 +211,112 @@ async fn smoke_test() -> Result<(), Box<dyn Error>> {
 // TODO: TableUsageRequest (verify rfc3339 semantics)
 // TODO: WriteMultiple with all pass, some pass, all fail, if present, etc.
 // TODO: MultiDeleteRequest
+
+#[tokio::test]
+async fn drop_index_test() -> Result<(), Box<dyn Error>> {
+    let handle = get_builder()?.build().await?;
+    let table_name = unique_table_name("dropindextest");
+    let index_name = "idx_dropindextest_name";
+
+    TableRequest::new(&table_name)
+        .statement(&format!(
+            "create table {} (id integer, name string, primary key(id))",
+            table_name
+        ))
+        .limits(&TableLimits::provisioned(10, 10, 10))
+        .execute(&handle)
+        .await?
+        .wait_for_completion_ms(&handle, 15000, 500)
+        .await?;
+
+    TableRequest::new(&table_name)
+        .statement(&format!(
+            "create index {} on {} (name)",
+            index_name, table_name
+        ))
+        .execute(&handle)
+        .await?
+        .wait_for_completion_ms(&handle, 15000, 500)
+        .await?;
+
+    TableRequest::new(&table_name)
+        .statement(&format!("drop index {} on {}", index_name, table_name))
+        .execute(&handle)
+        .await?
+        .wait_for_completion_ms(&handle, 15000, 500)
+        .await?;
+
+    TableRequest::new(&table_name)
+        .statement(&format!("drop table if exists {}", table_name))
+        .execute(&handle)
+        .await?
+        .wait_for_completion_ms(&handle, 15000, 500)
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn advanced_query_internal_fetch_options_test() -> Result<(), Box<dyn Error>> {
+    let handle = get_builder()?.build().await?;
+    let table_name = unique_table_name("advancedqueryopts");
+
+    let test_result: Result<(), Box<dyn Error>> = async {
+        TableRequest::new(&table_name)
+            .statement(&format!(
+                "create table {} (id integer, payload string, primary key(id))",
+                table_name
+            ))
+            .limits(&TableLimits::provisioned(1000, 1000, 10))
+            .execute(&handle)
+            .await?
+            .wait_for_completion_ms(&handle, 15000, 500)
+            .await?;
+
+        for i in (0..12).rev() {
+            let payload = format!("{:02}-{}", i, "x".repeat(1024));
+            PutRequest::new(&table_name)
+                .value(MapValue::new().i32("id", i).str("payload", &payload))
+                .execute(&handle)
+                .await?;
+        }
+
+        let mut query = QueryRequest::new(&format!(
+            "select id, payload from {} order by payload",
+            table_name
+        ))
+        .compartment_id("ignored-by-cloudsim")
+        .consistency(&Consistency::Eventual)
+        .max_read_kb(1)
+        .max_write_kb(1);
+        let result = query.execute(&handle).await?;
+        assert_eq!(result.rows().len(), 12);
+
+        let mut previous = String::new();
+        for row in result.rows() {
+            let payload = row.get_string("payload").ok_or("payload missing")?;
+            assert!(payload.as_str() >= previous.as_str());
+            previous = payload;
+        }
+
+        Ok(())
+    }
+    .await;
+
+    let cleanup_result = async {
+        TableRequest::new(&table_name)
+            .statement(&format!("drop table if exists {}", table_name))
+            .execute(&handle)
+            .await?
+            .wait_for_completion_ms(&handle, 15000, 500)
+            .await
+    }
+    .await;
+
+    test_result?;
+    cleanup_result?;
+    Ok(())
+}
 
 #[derive(Default, Debug, NoSQLRow)]
 struct Person {

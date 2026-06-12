@@ -13,6 +13,7 @@ use reqwest::Method;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
+use std::fmt;
 use std::time::Duration;
 use tracing::{debug, instrument, trace};
 use url::Url;
@@ -23,7 +24,7 @@ use crate::auth_common::signer;
 static METADATA_URL_BASE: &str = "http://169.254.169.254/opc/v2";
 static EMPTY_STRING: &str = "";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InstancePrincipalAuthProvider {
     token: String,
     session_private_key: Rsa<Private>,
@@ -31,6 +32,18 @@ pub struct InstancePrincipalAuthProvider {
     fingerprint: String,
     region: String,
     //expiration: u64, // seconds since the epoch
+}
+
+impl fmt::Debug for InstancePrincipalAuthProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InstancePrincipalAuthProvider")
+            .field("token", &"[redacted]")
+            .field("session_private_key", &"[redacted]")
+            .field("tenancy_id", &self.tenancy_id)
+            .field("fingerprint", &self.fingerprint)
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 impl AuthenticationProvider for InstancePrincipalAuthProvider {
@@ -77,7 +90,7 @@ impl InstancePrincipalAuthProvider {
             .await?
             .text()
             .await?;
-        trace!("Leaf certificate: {:?}", leaf_certificate);
+        trace!("received leaf certificate: len={}", leaf_certificate.len());
 
         let leaf_certificate_private_key_url: &str =
             &format!("{}/identity/key.pem", METADATA_URL_BASE);
@@ -253,24 +266,17 @@ async fn get_security_token_from_auth_service(
         HashMap::new(),
         false,
     )?;
-    trace!(
-        "Sending http post request to {} \n with headers : {:?}",
-        url,
-        required_headers
-    );
+    trace!("sending IAM auth token request to {}", url);
     let response = client
         .post(url)
         .body(jwt_request_body)
         .headers(required_headers)
         .send()
         .await?;
-    trace!("Response received from the service : {:?}", response);
-    if !response.status().is_success() {
-        return Err(format!(
-            "IAM auth service returned status {}",
-            response.status().as_str()
-        )
-        .into());
+    let status = response.status();
+    trace!("IAM auth service response status: {}", status);
+    if !status.is_success() {
+        return Err(format!("IAM auth service returned status {}", status.as_str()).into());
     }
 
     let rtext = response.text().await?;
@@ -299,3 +305,24 @@ pub fn now_in_secs() -> u64 {
 //let response = sdk_client.get(url_data).await;
 //response
 //}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_token_and_private_key() {
+        let provider = InstancePrincipalAuthProvider {
+            token: "ST$secret-security-token".to_string(),
+            session_private_key: Rsa::generate(2048).unwrap(),
+            tenancy_id: "tenancy".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            region: "region".to_string(),
+        };
+
+        let debug = format!("{:?}", provider);
+
+        assert!(!debug.contains("secret-security-token"));
+        assert!(debug.contains("[redacted]"));
+    }
+}

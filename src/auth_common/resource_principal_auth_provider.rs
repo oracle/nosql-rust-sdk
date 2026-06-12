@@ -10,6 +10,7 @@ use openssl::rsa::Rsa;
 use serde_json::Value;
 use std::env;
 use std::error::Error;
+use std::fmt;
 use tracing::trace;
 
 use crate::auth_common::authentication_provider::AuthenticationProvider;
@@ -37,13 +38,24 @@ static RP_REGION_ENV: &str = "OCI_RESOURCE_PRINCIPAL_REGION";
 // the key used to look up the resource tenancy in an RPST
 static TENANCY_CLAIM_KEY: &str = "res_tenant";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResourcePrincipalAuthProvider {
     token: String,
     session_private_key: Rsa<Private>,
     tenancy_id: String,
     region: String,
     //expiration: u64, // seconds since the epoch
+}
+
+impl fmt::Debug for ResourcePrincipalAuthProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResourcePrincipalAuthProvider")
+            .field("token", &"[redacted]")
+            .field("session_private_key", &"[redacted]")
+            .field("tenancy_id", &self.tenancy_id)
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 impl AuthenticationProvider for ResourcePrincipalAuthProvider {
@@ -195,19 +207,7 @@ impl ResourcePrincipalAuthProvider {
                 .into());
         }
         trace!("rpst expiration={}", exp);
-        let token_last_4: String = token
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        trace!(
-            "using RPST token: len={}, last4={}",
-            token.chars().count(),
-            token_last_4
-        );
+        trace!("using RPST token: len={}", token.chars().count());
 
         Ok(ResourcePrincipalAuthProvider {
             token: format!("ST${}", token),
@@ -222,4 +222,24 @@ impl ResourcePrincipalAuthProvider {
 // an absolute path.
 fn is_path(val: &str) -> bool {
     std::path::Path::new(val).is_absolute()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_token_and_private_key() {
+        let provider = ResourcePrincipalAuthProvider {
+            token: "ST$secret-rpst-token".to_string(),
+            session_private_key: Rsa::generate(2048).unwrap(),
+            tenancy_id: "tenancy".to_string(),
+            region: "region".to_string(),
+        };
+
+        let debug = format!("{:?}", provider);
+
+        assert!(!debug.contains("secret-rpst-token"));
+        assert!(debug.contains("[redacted]"));
+    }
 }

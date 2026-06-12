@@ -123,7 +123,10 @@ pub fn get_required_headers_ext(
         key_id, joined_signed_headers, signature
     );
 
-    trace!("inserting auth header: {}", authorization_header);
+    trace!(
+        "inserting authorization header with signed headers: {}",
+        joined_signed_headers
+    );
     new_headers.insert(AUTHORIZATION_HEADER, authorization_header.parse()?);
 
     Ok(new_headers)

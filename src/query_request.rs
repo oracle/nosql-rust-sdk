@@ -402,6 +402,10 @@ impl QueryRequest {
         }
         QueryRequest {
             is_internal: true,
+            max_read_kb: self.max_read_kb,
+            max_write_kb: self.max_write_kb,
+            consistency: self.consistency,
+            compartment_id: self.compartment_id.clone(),
             prepared_statement: self
                 .prepared_statement
                 .copy_for_internal(self.active_query_branch),
@@ -410,7 +414,6 @@ impl QueryRequest {
             // purposefully not copying registers
             num_registers: -1,
             timeout: self.timeout.clone(),
-            compartment_id: self.compartment_id.clone(),
             topology_info: self.topology_info.clone(),
             ..Default::default()
         }

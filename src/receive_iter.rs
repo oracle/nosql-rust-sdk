@@ -341,6 +341,7 @@ impl RemoteScanner {
         req_copy
             .execute_batch_internal(handle, &mut vr, data)
             .await?;
+        let reached_limit = req_copy.reached_limit || req_copy.continuation_key.is_some();
         debug!(
             "EBI returned {} results (shard={}): {:?}",
             vr.len(),
@@ -348,6 +349,7 @@ impl RemoteScanner {
             vr
         );
         self.add_results(VecDeque::from(vr), req_copy.continuation_key);
+        req.reached_limit = reached_limit;
         req.consumed_capacity.add(&req_copy.consumed_capacity);
 
         // TODO: if (theVirtualScan != null && theVirtualScan.isFirstBatch()) {
