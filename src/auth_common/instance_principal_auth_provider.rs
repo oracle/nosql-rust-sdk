@@ -14,6 +14,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::{debug, instrument, trace};
 use url::Url;
@@ -23,6 +25,8 @@ use crate::auth_common::signer;
 
 static METADATA_URL_BASE: &str = "http://169.254.169.254/opc/v2";
 static EMPTY_STRING: &str = "";
+#[cfg(test)]
+static EXPECTED_NEW_WITH_CLIENT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 pub struct InstancePrincipalAuthProvider {
@@ -69,14 +73,32 @@ impl AuthenticationProvider for InstancePrincipalAuthProvider {
 }
 
 impl InstancePrincipalAuthProvider {
-    pub async fn new() -> Result<InstancePrincipalAuthProvider, Box<dyn Error>> {
-        InstancePrincipalAuthProvider::new_with_client(&reqwest::Client::builder().build()?).await
+    #[cfg(test)]
+    pub(crate) fn expect_next_new_with_client_for_test(client: &reqwest::Client) {
+        EXPECTED_NEW_WITH_CLIENT.store(client as *const reqwest::Client as usize, Ordering::SeqCst);
     }
 
     #[instrument(skip(client))]
     pub async fn new_with_client(
         client: &reqwest::Client,
     ) -> Result<InstancePrincipalAuthProvider, Box<dyn Error>> {
+        #[cfg(test)]
+        {
+            let expected = EXPECTED_NEW_WITH_CLIENT.swap(0, Ordering::SeqCst);
+            if expected != 0 {
+                let actual = client as *const reqwest::Client as usize;
+                let message = if actual == expected {
+                    "test marker: instance principal used supplied client".to_string()
+                } else {
+                    format!(
+                        "test marker: instance principal used unexpected client {:x}, expected {:x}",
+                        actual, expected
+                    )
+                };
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, message).into());
+            }
+        }
+
         let mut auth_headers: HeaderMap = HeaderMap::new();
         auth_headers.insert("Authorization", "Bearer Oracle".parse()?);
 

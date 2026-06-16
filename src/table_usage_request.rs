@@ -5,7 +5,6 @@
 //  https://oss.oracle.com/licenses/upl/
 //
 use crate::error::NoSQLError;
-use crate::error::NoSQLErrorCode::BadProtocolMessage;
 use crate::handle::Handle;
 use crate::handle::SendOptions;
 use crate::nson::*;
@@ -176,7 +175,7 @@ impl TableUsageRequest {
             ns.write_string_field(END, &s);
         }
         ns.write_nonzero_i32_field(LIST_MAX_TO_READ, self.limit);
-        ns.write_nonzero_i32_field(LIST_MAX_TO_READ, self.start_index);
+        ns.write_nonzero_i32_field(LIST_START_INDEX, self.start_index);
         ns.end_payload();
 
         ns.end_request();
@@ -203,14 +202,10 @@ impl TableUsageRequest {
                     MapWalker::expect_type(walker.r, FieldType::Array)?;
                     let _ = walker.r.read_i32()?; // skip array size in bytes
                     let num_elements = walker.r.read_i32()?;
-                    if num_elements < 0 || (num_elements as usize) > walker.r.buf.len() {
-                        return Err(NoSQLError::new(
-                            BadProtocolMessage,
-                            "invalid num_elements in usage array",
-                        ));
-                    }
-                    res.usage_records = Vec::with_capacity(num_elements as usize);
-                    for _n in 1..=num_elements {
+                    let num_elements = walker.r.checked_count(num_elements, "usage array")?;
+                    res.usage_records = Vec::new();
+                    Reader::try_reserve_vec(&mut res.usage_records, num_elements, "usage array")?;
+                    for _n in 0..num_elements {
                         res.usage_records
                             .push(TableUsageRequest::read_usage_record(walker.r)?);
                     }

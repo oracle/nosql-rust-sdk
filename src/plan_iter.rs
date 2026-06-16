@@ -487,7 +487,9 @@ pub(crate) fn deserialize_plan_iters(r: &mut Reader) -> Result<Vec<Box<PlanIter>
         return Ok(Vec::new());
     }
 
-    let mut iters: Vec<Box<PlanIter>> = Vec::with_capacity(n as usize);
+    let n = r.checked_count(n, "plan iterator sequence")?;
+    let mut iters: Vec<Box<PlanIter>> = Vec::new();
+    Reader::try_reserve_vec(&mut iters, n, "plan iterator sequence")?;
     for _i in 0..n {
         let iter = deserialize_plan_iter(r)?;
         if iter.get_kind() != PlanIterKind::Empty {

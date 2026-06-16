@@ -132,14 +132,10 @@ impl GetIndexesRequest {
                     MapWalker::expect_type(walker.r, FieldType::Array)?;
                     let _ = walker.r.read_i32()?; // skip array size in bytes
                     let num_elements = walker.r.read_i32()?;
-                    if num_elements < 0 || (num_elements as usize) > walker.r.buf.len() {
-                        return Err(NoSQLError::new(
-                            BadProtocolMessage,
-                            "invalid num_elements in index array",
-                        ));
-                    }
-                    res.indexes = Vec::with_capacity(num_elements as usize);
-                    for _n in 1..=num_elements {
+                    let num_elements = walker.r.checked_count(num_elements, "index array")?;
+                    res.indexes = Vec::new();
+                    Reader::try_reserve_vec(&mut res.indexes, num_elements, "index array")?;
+                    for _n in 0..num_elements {
                         res.indexes
                             .push(GetIndexesRequest::read_index_info(walker.r)?);
                     }
@@ -169,15 +165,12 @@ impl GetIndexesRequest {
                     MapWalker::expect_type(walker.r, FieldType::Array)?;
                     let _ = walker.r.read_i32()?; // skip array size in bytes
                     let num_elements = walker.r.read_i32()?;
-                    if num_elements < 0 || (num_elements as usize) > walker.r.buf.len() {
-                        return Err(NoSQLError::new(
-                            BadProtocolMessage,
-                            "invalid num_elements in fields array",
-                        ));
-                    }
-                    res.field_names = Vec::with_capacity(num_elements as usize);
-                    res.field_types = Vec::with_capacity(num_elements as usize);
-                    for _n in 1..=num_elements {
+                    let num_elements = walker.r.checked_count(num_elements, "fields array")?;
+                    res.field_names = Vec::new();
+                    res.field_types = Vec::new();
+                    Reader::try_reserve_vec(&mut res.field_names, num_elements, "fields array")?;
+                    Reader::try_reserve_vec(&mut res.field_types, num_elements, "fields array")?;
+                    for _n in 0..num_elements {
                         GetIndexesRequest::read_index_fields(walker.r, &mut res)?;
                     }
                 }

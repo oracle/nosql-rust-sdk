@@ -600,7 +600,7 @@ impl HandleBuilder {
         match &mut pguard.provider {
             AuthProvider::Instance { provider: _ } => {
                 // create an entirely new IP auth, as currently IP Auth has no methods to refresh itself
-                let ifp = InstancePrincipalAuthProvider::new().await?;
+                let ifp = InstancePrincipalAuthProvider::new_with_client(client).await?;
                 pguard.provider = AuthProvider::Instance {
                     provider: Box::new(ifp),
                 };
@@ -747,6 +747,33 @@ impl OnpremAuthProvider {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug)]
+    struct TestAuthProvider;
+
+    impl AuthenticationProvider for TestAuthProvider {
+        fn tenancy_id(&self) -> &str {
+            "tenancy"
+        }
+
+        fn fingerprint(&self) -> &str {
+            "fingerprint"
+        }
+
+        fn user_id(&self) -> &str {
+            "user"
+        }
+
+        fn private_key(
+            &self,
+        ) -> Result<openssl::rsa::Rsa<openssl::pkey::Private>, Box<dyn std::error::Error>> {
+            Ok(openssl::rsa::Rsa::generate(2048)?)
+        }
+
+        fn region_id(&self) -> &str {
+            "region"
+        }
+    }
+
     #[test]
     fn onprem_debug_redacts_credentials_and_token() {
         let auth_ref = OnpremAuthProviderRef {
@@ -795,5 +822,27 @@ mod tests {
         assert!(!auth_debug.contains("secret-password"));
         assert!(builder_debug.contains("[redacted]"));
         assert!(auth_debug.contains("[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn instance_principal_refresh_uses_supplied_client() {
+        let client = Client::builder().build().unwrap();
+        InstancePrincipalAuthProvider::expect_next_new_with_client_for_test(&client);
+        let mut builder = HandleBuilder::new();
+        builder.auth_type = AuthType::Instance;
+        builder.auth = Arc::new(tokio::sync::Mutex::new(AuthConfig {
+            provider: AuthProvider::Instance {
+                provider: Box::new(TestAuthProvider),
+            },
+        }));
+
+        let err = builder.refresh_auth(&client).await.unwrap_err();
+
+        assert!(
+            err.message
+                .contains("test marker: instance principal used supplied client"),
+            "{}",
+            err
+        );
     }
 }

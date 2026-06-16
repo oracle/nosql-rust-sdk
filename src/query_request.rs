@@ -6,6 +6,7 @@
 //
 use crate::error::ia_err;
 use crate::error::NoSQLError;
+use crate::error::NoSQLErrorCode;
 use crate::handle::Handle;
 use crate::handle::SendOptions;
 use crate::nson::*;
@@ -817,9 +818,11 @@ impl QueryRequest {
         walker.r.read_i32()?; // length of array in bytes
         let num_elements = walker.r.read_i32()?;
         trace!("read_results: num_results={}", num_elements);
-        if num_elements <= 0 {
+        let num_elements = walker.r.checked_count(num_elements, "query results")?;
+        if num_elements == 0 {
             return Ok(());
         }
+        Reader::try_reserve_vec(results, num_elements, "query results")?;
         for _i in 0..num_elements {
             if let FieldValue::Map(m) = walker.r.read_field_value()? {
                 //println!("Result: {:?}", m);
@@ -1037,21 +1040,32 @@ impl QueryRequest {
         if self.prepared_statement.driver_query_plan.get_kind() == PlanIterKind::Empty {
             return Ok(());
         }
-        self.prepared_statement.num_iterators = r.read_i32()?;
+        let num_iterators = r.read_i32()?;
+        Reader::checked_count_with_limit(num_iterators, v.len(), "driver plan iterators")?;
+        self.prepared_statement.num_iterators = num_iterators;
         //println!(
         //"   QUERY_PLAN: iterators={}",
         //self.prepared_statement.num_iterators
         //);
-        self.prepared_statement.num_registers = r.read_i32()?;
+        let num_registers = r.read_i32()?;
+        Reader::checked_count_with_limit(num_registers, v.len(), "driver plan registers")?;
+        self.prepared_statement.num_registers = num_registers;
         //println!(
         //"   QUERY_PLAN: registers={}",
         //self.prepared_statement.num_registers
         //);
         let len = r.read_i32()?;
-        if len <= 0 {
+        let len = r.checked_count(len, "driver plan variables")?;
+        if len == 0 {
             return Ok(());
         }
-        let mut hm: HashMap<String, i32> = HashMap::with_capacity(len as usize);
+        let mut hm: HashMap<String, i32> = HashMap::new();
+        hm.try_reserve(len).map_err(|_| {
+            NoSQLError::new(
+                NoSQLErrorCode::BadProtocolMessage,
+                "unable to reserve decoded values for driver plan variables",
+            )
+        })?;
         for _i in 0..len {
             let name = r.read_string()?;
             let id = r.read_i32()?;
@@ -1080,30 +1094,34 @@ impl QueryRequest {
     }
 
     pub(crate) fn get_result(&mut self, reg: i32) -> FieldValue {
-        if self.num_registers <= reg {
-            panic!("INVALID GET REGISTER ACCESS");
-        }
+        let reg = self.register_index(reg, "GET");
         //println!(
         //" get_result register {}: {:?}",
         //reg, self.registers[reg as usize]
         //);
-        std::mem::take(&mut self.registers[reg as usize])
+        std::mem::take(&mut self.registers[reg])
     }
 
     pub(crate) fn get_result_ref(&self, reg: i32) -> &FieldValue {
+        let reg = self.register_index(reg, "GET");
         //println!(
         //" get_result_ref register {}: {:?}",
         //reg, self.registers[reg as usize]
         //);
-        &self.registers[reg as usize]
+        &self.registers[reg]
     }
 
     pub(crate) fn set_result(&mut self, reg: i32, val: FieldValue) {
-        if self.num_registers <= reg {
-            panic!("INVALID SET REGISTER ACCESS");
-        }
+        let reg = self.register_index(reg, "SET");
         //println!(" set_result register {}: {:?}", reg, val);
-        self.registers[reg as usize] = val;
+        self.registers[reg] = val;
+    }
+
+    fn register_index(&self, reg: i32, op: &str) -> usize {
+        if reg < 0 || self.num_registers <= reg {
+            panic!("INVALID {} REGISTER ACCESS", op);
+        }
+        reg as usize
     }
 }
 
@@ -1148,5 +1166,15 @@ mod tests {
         let mut prepared_mutation = prepared_select.clone();
         prepared_mutation.operation = 0;
         assert!(!QueryRequest::new_prepared(&prepared_mutation).is_retryable());
+    }
+
+    #[test]
+    #[should_panic(expected = "INVALID GET REGISTER ACCESS")]
+    fn negative_query_register_is_rejected_before_indexing() {
+        let mut request = QueryRequest::default();
+        request.num_registers = 1;
+        request.registers.push(FieldValue::Uninitialized);
+
+        let _ = request.get_result(-1);
     }
 }

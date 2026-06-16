@@ -12,6 +12,7 @@ use crate::multi_delete_request::*;
 use crate::put_request::*;
 use crate::system_request::*;
 use crate::table_request::*;
+use crate::table_usage_request::*;
 use crate::write_multiple_request::*;
 use crate::{nson::*, reader::Reader, types::*, writer::Writer};
 use std::error::Error;
@@ -136,6 +137,25 @@ fn test_write_multiple_delete_subrequest_serializes_map() -> Result<(), Box<dyn 
     assert_eq!(operation.get_bool(RETURN_ROW), Some(true));
     let key = operation.get_map(KEY).ok_or("key missing")?;
     assert_eq!(key.get_i32("id"), Some(42));
+
+    Ok(())
+}
+
+#[test]
+fn test_table_usage_request_serializes_start_index() -> Result<(), Box<dyn Error>> {
+    let timeout = Duration::from_millis(30000);
+    let request = TableUsageRequest::new("testusers")
+        .limit(10)
+        .start_index(25);
+    let mut w = Writer::new();
+    do_serialize(&request, &mut w, &timeout);
+
+    let mut reader = Reader::new().from_bytes(w.bytes());
+    let request = reader.read_field_value()?.get_map_value()?;
+    let payload = request.get_map(PAYLOAD).ok_or("payload missing")?;
+
+    assert_eq!(payload.get_i32(LIST_MAX_TO_READ), Some(10));
+    assert_eq!(payload.get_i32(LIST_START_INDEX), Some(25));
 
     Ok(())
 }

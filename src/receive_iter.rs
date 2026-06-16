@@ -685,8 +685,14 @@ impl ReceiveIter {
                 return ia_err!("expected more results than we got");
             }
 
-            let mut part_results: VecDeque<MapValue> =
-                VecDeque::with_capacity(num_results as usize);
+            let num_results = num_results as usize;
+            let mut part_results: VecDeque<MapValue> = VecDeque::new();
+            part_results.try_reserve(num_results).map_err(|_| {
+                NoSQLError::new(
+                    BadProtocolMessage,
+                    "unable to reserve decoded values for partition results",
+                )
+            })?;
             for _j in 0..num_results {
                 if let Some(r) = results.pop_front() {
                     part_results.push_back(r);
