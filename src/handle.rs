@@ -380,21 +380,26 @@ impl Handle {
         data: &Vec<u8>,
         send_options: &mut SendOptions,
     ) -> Result<Vec<u8>, NoSQLError> {
+        self.inner.builder.refresh_auth_if_needed().await?;
+
         let request_id = self.inner.request_id.fetch_add(1, Ordering::Relaxed);
         let mut headers = HeaderMap::new();
         headers.insert("x-nosql-request-id", HeaderValue::from(request_id));
 
         // If there is an oci auth provider, use that to set up required headers
         let mut oci_provider: Option<&Box<dyn AuthenticationProvider>> = None;
+        let mut requires_explicit_compartment = false;
 
         // We need to lock the auth config because it may be asynchronously refreshed elsewhere
         let pguard = self.inner.builder.auth.lock().await;
         match &pguard.provider {
             AuthProvider::Instance { provider } => {
                 oci_provider = Some(provider);
+                requires_explicit_compartment = true;
             }
             AuthProvider::Resource { provider } => {
                 oci_provider = Some(provider);
+                requires_explicit_compartment = true;
             }
             AuthProvider::External { provider } => {
                 oci_provider = Some(provider);
@@ -412,17 +417,16 @@ impl Handle {
         }
 
         if let Some(sp) = oci_provider {
-            if !self.inner.builder.default_compartment_id.is_empty() {
-                headers.insert(
-                    "x-nosql-compartment-id",
-                    HeaderValue::from_str(&self.inner.builder.default_compartment_id)?,
-                );
-            } else {
-                headers.insert(
-                    "x-nosql-compartment-id",
-                    HeaderValue::from_str(sp.tenancy_id())?,
-                );
-            }
+            let compartment_id = Self::effective_compartment_id(
+                send_options,
+                &self.inner.builder.default_compartment_id,
+                sp.tenancy_id(),
+                requires_explicit_compartment,
+            )?;
+            headers.insert(
+                "x-nosql-compartment-id",
+                HeaderValue::from_str(&compartment_id)?,
+            );
             {
                 // If there's a session cookie value, set it into the headers.
                 // The lock is needed because another async operation might try to
@@ -451,14 +455,6 @@ impl Handle {
         }
         // this will unlock the auth mutex
         core::mem::drop(pguard);
-
-        // let send_options.compartment_id override compartment header
-        if !send_options.compartment_id.is_empty() {
-            headers.insert(
-                "x-nosql-compartment-id",
-                HeaderValue::from_str(&send_options.compartment_id)?,
-            );
-        }
 
         // let send_options.namespace override namespace header
         if !send_options.namespace.is_empty() {
@@ -634,6 +630,26 @@ impl Handle {
             && (err.code == NoSQLErrorCode::SecurityInfoUnavailable
                 || err.code == NoSQLErrorCode::RetryAuthentication
                 || err.code == NoSQLErrorCode::InvalidAuthorization)
+    }
+
+    fn effective_compartment_id(
+        send_options: &SendOptions,
+        default_compartment_id: &str,
+        tenancy_id: &str,
+        requires_explicit_compartment: bool,
+    ) -> Result<String, NoSQLError> {
+        if !send_options.compartment_id.is_empty() {
+            return Ok(send_options.compartment_id.clone());
+        }
+        if !default_compartment_id.is_empty() {
+            return Ok(default_compartment_id.to_string());
+        }
+        if requires_explicit_compartment {
+            return ia_err!(
+                "instance principal and resource principal authentication require an explicit compartment id"
+            );
+        }
+        Ok(tenancy_id.to_string())
     }
 
     async fn apply_rate_limiting(&self, send_options: &mut SendOptions) -> Result<(), NoSQLError> {
@@ -1057,5 +1073,52 @@ mod tests {
             },
             &siu
         ));
+    }
+
+    #[test]
+    fn effective_compartment_requires_explicit_value_for_instance_and_resource_principals() {
+        let err = Handle::effective_compartment_id(
+            &SendOptions::default(),
+            "",
+            "ocid1.tenancy.oc1..root",
+            true,
+        )
+        .unwrap_err();
+
+        assert!(err.message.contains("explicit compartment id"));
+
+        let request_compartment = Handle::effective_compartment_id(
+            &SendOptions {
+                compartment_id: "ocid1.compartment.oc1..request".to_string(),
+                ..Default::default()
+            },
+            "",
+            "ocid1.tenancy.oc1..root",
+            true,
+        )
+        .unwrap();
+        assert_eq!(request_compartment, "ocid1.compartment.oc1..request");
+
+        let default_compartment = Handle::effective_compartment_id(
+            &SendOptions::default(),
+            "ocid1.compartment.oc1..default",
+            "ocid1.tenancy.oc1..root",
+            true,
+        )
+        .unwrap();
+        assert_eq!(default_compartment, "ocid1.compartment.oc1..default");
+    }
+
+    #[test]
+    fn effective_compartment_keeps_tenancy_fallback_for_user_principals() {
+        let compartment = Handle::effective_compartment_id(
+            &SendOptions::default(),
+            "",
+            "ocid1.tenancy.oc1..root",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(compartment, "ocid1.tenancy.oc1..root");
     }
 }

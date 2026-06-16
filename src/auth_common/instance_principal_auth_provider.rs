@@ -198,25 +198,22 @@ async fn get_instance_metadata(
 fn get_tenancy_id_from_certificate(cert: &str) -> Result<String, Box<dyn Error>> {
     let cert = cert.as_bytes();
     let cert = X509::from_pem(cert)?;
-    let mut subject = String::from_utf8_lossy(&cert.to_text()?).into_owned();
 
-    // In text form, the cert contains a Subject line like this:
-    // Subject: CN=ocid1.instance.oc1.eu-zurich-1.an5heljrckmxu5ichjk4nyxrwqg3abrsafgyh4niyl6vs3lmdjfjio3t463a, OU=opc-certtype:instance, OU=opc-compartment:ocid1.tenancy.oc1..aaaaaaaattuxbj75pnn3nksvzyidshdbrfmmeflv4kkemajroz2thvca4kba, OU=opc-instance:ocid1.instance.oc1.eu-zurich-1.an5heljrckmxu5ichjk4nyxrwqg3abrsafgyh4niyl6vs3lmdjfjio3t463a, OU=opc-tenant:ocid1.tenancy.oc1..aaaaaaaattuxbj75pnn3nksvzyidshdbrfmmeflv4kkemajroz2thvca4kba
-    // This code attempts to extract the 'opc-tenant:____________' value
-    // Note the cert also has the compartment ocid as well, which may be useful for users of this library
+    // Instance principal certificates carry the tenancy as an X509 subject value
+    // such as OU=opc-tenant:ocid1.tenancy.oc1...
+    for entry in cert.subject_name().entries() {
+        let value = match entry.data().as_utf8() {
+            Ok(value) => value.to_string(),
+            Err(_) => continue,
+        };
 
-    if let Some(off) = subject.find("=opc-tenant:ocid1.tenancy.") {
-        // 12 == length of "=opc-tenant:"
-        let mut tenancy_id = subject.split_off(off + 12);
-        // strip trailing: start at comma, newline, or space
-        for i in [',', ' ', '\n', '\r'] {
-            if let Some(coff) = tenancy_id.find(i) {
-                let _ = tenancy_id.split_off(coff - 1);
+        if let Some(tenancy_id) = value.strip_prefix("opc-tenant:") {
+            if tenancy_id.starts_with("ocid1.tenancy.") {
+                return Ok(tenancy_id.to_string());
             }
         }
-        //println!("tenancy='{}'", tenancy_id);
-        return Ok(tenancy_id);
     }
+
     return Err("Cannot find tenancy id in certificate".into());
 }
 
@@ -331,6 +328,12 @@ pub fn now_in_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openssl::asn1::{Asn1Integer, Asn1Time};
+    use openssl::bn::BigNum;
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+    use openssl::x509::X509NameBuilder;
 
     #[test]
     fn debug_redacts_token_and_private_key() {
@@ -346,5 +349,53 @@ mod tests {
 
         assert!(!debug.contains("secret-security-token"));
         assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn tenancy_id_from_certificate_preserves_last_character_before_next_subject_entry() {
+        let tenancy_id = "ocid1.tenancy.oc1..abcdefghijklmnopqrstu";
+        let cert = test_certificate_with_subject_entries(&[
+            (Nid::COMMONNAME, "ocid1.instance.oc1.iad.example"),
+            (Nid::ORGANIZATIONALUNITNAME, "opc-certtype:instance"),
+            (
+                Nid::ORGANIZATIONALUNITNAME,
+                &format!("opc-tenant:{tenancy_id}"),
+            ),
+            (
+                Nid::ORGANIZATIONALUNITNAME,
+                "opc-instance:ocid1.instance.oc1.iad.example",
+            ),
+        ]);
+
+        let parsed = get_tenancy_id_from_certificate(&cert).unwrap();
+
+        assert_eq!(parsed, tenancy_id);
+    }
+
+    fn test_certificate_with_subject_entries(entries: &[(Nid, &str)]) -> String {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut name_builder = X509NameBuilder::new().unwrap();
+        for (nid, value) in entries {
+            name_builder.append_entry_by_nid(*nid, value).unwrap();
+        }
+        let subject_name = name_builder.build();
+
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        let serial_number = BigNum::from_u32(1).unwrap();
+        let serial_number = Asn1Integer::from_bn(&serial_number).unwrap();
+        builder.set_serial_number(&serial_number).unwrap();
+        builder.set_subject_name(&subject_name).unwrap();
+        builder.set_issuer_name(&subject_name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        let not_before = Asn1Time::days_from_now(0).unwrap();
+        let not_after = Asn1Time::days_from_now(1).unwrap();
+        builder.set_not_before(&not_before).unwrap();
+        builder.set_not_after(&not_after).unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+
+        String::from_utf8(builder.build().to_pem().unwrap()).unwrap()
     }
 }

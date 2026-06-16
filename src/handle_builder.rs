@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::auth_common::authentication_provider::AuthenticationProvider;
 use crate::auth_common::config_file_authentication_provider::ConfigFileAuthenticationProvider;
 use crate::auth_common::instance_principal_auth_provider::InstancePrincipalAuthProvider;
+use crate::auth_common::resource_principal_auth_provider::ResourcePrincipalAuthProvider;
 use crate::error::{ia_err, NoSQLError};
 use crate::handle::Handle;
 use reqwest::header::HeaderValue;
@@ -436,7 +437,9 @@ impl HandleBuilder {
     ///
     /// This value may be overridden on a per-request basis.
     ///
-    /// If no compartment is given, the root compartment of the tenancy will be used.
+    /// If no compartment is given, user-based OCI authentication uses the root compartment of the tenancy.
+    /// Instance-principal and resource-principal authentication require either this default compartment
+    /// or a per-request compartment id.
     pub fn compartment_id(mut self, compartment_id: &str) -> Result<Self, NoSQLError> {
         self.default_compartment_id = compartment_id.to_string();
         Ok(self)
@@ -606,6 +609,13 @@ impl HandleBuilder {
                 };
                 return Ok(true);
             }
+            AuthProvider::Resource { provider: _ } => {
+                let rfp = ResourcePrincipalAuthProvider::new()?;
+                pguard.provider = AuthProvider::Resource {
+                    provider: Box::new(rfp),
+                };
+                return Ok(true);
+            }
             AuthProvider::Onprem { provider } => {
                 if let Some(prov) = provider {
                     let _ = prov.generate_token(client, true).await?;
@@ -615,6 +625,20 @@ impl HandleBuilder {
             _ => {}
         }
         Ok(false)
+    }
+
+    pub(crate) async fn refresh_auth_if_needed(&self) -> Result<bool, NoSQLError> {
+        let mut pguard = self.auth.lock().await;
+        match &mut pguard.provider {
+            AuthProvider::Resource { provider } if provider.should_refresh() => {
+                let rfp = ResourcePrincipalAuthProvider::new()?;
+                pguard.provider = AuthProvider::Resource {
+                    provider: Box::new(rfp),
+                };
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 }
 
@@ -746,6 +770,9 @@ impl OnpremAuthProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64ct::{Base64Unpadded, Encoding};
+    use openssl::rsa::Rsa;
+    use std::env;
 
     #[derive(Clone, Debug)]
     struct TestAuthProvider;
@@ -771,6 +798,108 @@ mod tests {
 
         fn region_id(&self) -> &str {
             "region"
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ExpiringTestAuthProvider;
+
+    impl AuthenticationProvider for ExpiringTestAuthProvider {
+        fn tenancy_id(&self) -> &str {
+            "tenancy"
+        }
+
+        fn fingerprint(&self) -> &str {
+            "fingerprint"
+        }
+
+        fn user_id(&self) -> &str {
+            "user"
+        }
+
+        fn private_key(
+            &self,
+        ) -> Result<openssl::rsa::Rsa<openssl::pkey::Private>, Box<dyn std::error::Error>> {
+            Ok(openssl::rsa::Rsa::generate(2048)?)
+        }
+
+        fn region_id(&self) -> &str {
+            "region"
+        }
+
+        fn should_refresh(&self) -> bool {
+            true
+        }
+    }
+
+    static RESOURCE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ResourcePrincipalEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl Drop for ResourcePrincipalEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn set_resource_principal_env(tenancy_id: &str) -> ResourcePrincipalEnvGuard {
+        let lock = RESOURCE_ENV_LOCK.lock().unwrap();
+        let keys = [
+            "OCI_RESOURCE_PRINCIPAL_VERSION",
+            "OCI_RESOURCE_PRINCIPAL_RPST",
+            "OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM",
+            "OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM_PASSPHRASE",
+            "OCI_RESOURCE_PRINCIPAL_REGION",
+        ];
+        let saved = keys.iter().map(|key| (*key, env::var(key).ok())).collect();
+
+        env::set_var("OCI_RESOURCE_PRINCIPAL_VERSION", "2.2");
+        env::set_var(
+            "OCI_RESOURCE_PRINCIPAL_RPST",
+            test_rpst_token(tenancy_id, now_secs() + 3600),
+        );
+        env::set_var("OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM", test_private_key_pem());
+        env::remove_var("OCI_RESOURCE_PRINCIPAL_PRIVATE_PEM_PASSPHRASE");
+        env::set_var("OCI_RESOURCE_PRINCIPAL_REGION", "us-ashburn-1");
+
+        ResourcePrincipalEnvGuard { _lock: lock, saved }
+    }
+
+    fn test_rpst_token(tenancy_id: &str, expiration_secs: u64) -> String {
+        let header = Base64Unpadded::encode_string(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = Base64Unpadded::encode_string(
+            format!(r#"{{"res_tenant":"{tenancy_id}","exp":{expiration_secs}}}"#).as_bytes(),
+        );
+        format!("{header}.{payload}.signature")
+    }
+
+    fn test_private_key_pem() -> String {
+        let rsa = Rsa::generate(2048).unwrap();
+        String::from_utf8(rsa.private_key_to_pem().unwrap()).unwrap()
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    async fn assert_resource_provider_tenancy(builder: &HandleBuilder, tenancy_id: &str) {
+        let guard = builder.auth.lock().await;
+        match &guard.provider {
+            AuthProvider::Resource { provider } => {
+                assert_eq!(provider.tenancy_id(), tenancy_id);
+            }
+            provider => panic!("expected resource provider, got {:?}", provider),
         }
     }
 
@@ -822,6 +951,43 @@ mod tests {
         assert!(!auth_debug.contains("secret-password"));
         assert!(builder_debug.contains("[redacted]"));
         assert!(auth_debug.contains("[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn resource_principal_refresh_reloads_env_material_after_auth_error() {
+        let tenancy_id = "ocid1.tenancy.oc1..refreshed";
+        let _env_guard = set_resource_principal_env(tenancy_id);
+        let client = Client::builder().build().unwrap();
+        let mut builder = HandleBuilder::new();
+        builder.auth_type = AuthType::Resource;
+        builder.auth = Arc::new(tokio::sync::Mutex::new(AuthConfig {
+            provider: AuthProvider::Resource {
+                provider: Box::new(TestAuthProvider),
+            },
+        }));
+
+        let refreshed = builder.refresh_auth(&client).await.unwrap();
+
+        assert!(refreshed);
+        assert_resource_provider_tenancy(&builder, tenancy_id).await;
+    }
+
+    #[tokio::test]
+    async fn resource_principal_refresh_if_needed_reloads_expiring_provider() {
+        let tenancy_id = "ocid1.tenancy.oc1..preemptive";
+        let _env_guard = set_resource_principal_env(tenancy_id);
+        let mut builder = HandleBuilder::new();
+        builder.auth_type = AuthType::Resource;
+        builder.auth = Arc::new(tokio::sync::Mutex::new(AuthConfig {
+            provider: AuthProvider::Resource {
+                provider: Box::new(ExpiringTestAuthProvider),
+            },
+        }));
+
+        let refreshed = builder.refresh_auth_if_needed().await.unwrap();
+
+        assert!(refreshed);
+        assert_resource_provider_tenancy(&builder, tenancy_id).await;
     }
 
     #[tokio::test]
