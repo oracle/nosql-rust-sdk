@@ -42,10 +42,7 @@ impl SortSpec {
     }
     pub fn read_sort_specs(r: &mut Reader) -> Result<Vec<SortSpec>, NoSQLError> {
         let num = r.read_packed_i32()?;
-        if num < 0 {
-            return ia_err!("invalid sort spec count: {}", num);
-        }
-        if num == 0 {
+        if num <= 0 {
             return Ok(Vec::new());
         }
         let num = r.checked_count(num, "sort specs")?;
