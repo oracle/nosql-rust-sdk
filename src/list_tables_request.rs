@@ -86,6 +86,7 @@ impl ListTablesRequest {
             timeout: timeout,
             retryable: true,
             compartment_id: self.compartment_id.clone(),
+            namespace: self.namespace.clone(),
             ..Default::default()
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;

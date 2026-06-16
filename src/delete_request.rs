@@ -165,7 +165,7 @@ impl DeleteRequest {
         self.serialize_internal(&mut w, false, false, &timeout);
         let mut opts = SendOptions {
             timeout: timeout,
-            retryable: true,
+            retryable: false,
             compartment_id: self.compartment_id.clone(),
             table_name: self.table_name.clone(),
             does_reads: self.does_reads(),
@@ -224,8 +224,8 @@ impl DeleteRequest {
 
         if is_sub_request == false {
             ns.end_payload();
-            ns.end_request();
         }
+        ns.end_request();
     }
 
     pub(crate) fn nson_deserialize(r: &mut Reader) -> Result<DeleteResult, NoSQLError> {

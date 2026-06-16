@@ -92,6 +92,7 @@ impl GetIndexesRequest {
             timeout: timeout,
             retryable: true,
             compartment_id: self.compartment_id.clone(),
+            namespace: self.namespace.clone(),
             ..Default::default()
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
@@ -108,9 +109,9 @@ impl GetIndexesRequest {
         // payload
         ns.start_payload();
         ns.write_string_field(INDEX, &self.index_name);
+        ns.write_nonempty_string_field(NAMESPACE, &self.namespace);
         // TODO: these are currently only in http headers. Add to NSON?
         //ns.write_string_field(COMPARTMENT_OCID, &self.compartment_id);
-        //ns.write_string_field(NAMESPACE, &self.namespace);
         ns.end_payload();
 
         ns.end_request();

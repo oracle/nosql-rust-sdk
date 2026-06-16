@@ -39,6 +39,7 @@ const RATE_LIMITER_DURATION_SECS: f64 = 30.0;
 const RATE_LIMITER_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 const RATE_LIMITER_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const RATE_LIMITER_METADATA_TIMEOUT: Duration = Duration::from_secs(1);
+const SIU_NOT_AUTHENTICATED_MESSAGE: &str = "NotAuthenticated. ";
 
 /// **The main database handle**.
 ///
@@ -587,22 +588,15 @@ impl Handle {
         // allow for up to 4 retries, in case the routing to the service is doing round-robin
         // across instances (typically 3 in NoSQL cloud).
         // TODO: check current nano versus timeout at start of request
-        if send_options.retries < 40 && err.code == NoSQLErrorCode::SecurityInfoUnavailable {
-            // Note space at end of this message
-            if err.message == "NotAuthenticated. " {
-                // TODO: check remaining time for request based on timeout
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                trace!("waited 30ms, now retrying SIU error");
-                return Err(NoSQLError::new(InternalRetry, ""));
-            }
+        if Self::should_retry_not_authenticated(send_options, &err) {
+            // TODO: check remaining time for request based on timeout
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            trace!("waited 30ms, now retrying SIU error");
+            return Err(NoSQLError::new(InternalRetry, ""));
         }
         // For other auth errors, try refreshing the auth provider. It may have
         // expired credentials.
-        if send_options.retries < 4
-            && (err.code == NoSQLErrorCode::SecurityInfoUnavailable
-                || err.code == NoSQLErrorCode::RetryAuthentication
-                || err.code == NoSQLErrorCode::InvalidAuthorization)
-        {
+        if Self::should_refresh_auth_for_retry(send_options, &err) {
             let refreshed = self
                 .inner
                 .builder
@@ -625,6 +619,21 @@ impl Handle {
             trace!("attempt to refresh generated no error but did not refresh auth");
         }
         Err(err)
+    }
+
+    fn should_retry_not_authenticated(send_options: &SendOptions, err: &NoSQLError) -> bool {
+        send_options.retryable
+            && send_options.retries < 40
+            && err.code == NoSQLErrorCode::SecurityInfoUnavailable
+            && err.message == SIU_NOT_AUTHENTICATED_MESSAGE
+    }
+
+    fn should_refresh_auth_for_retry(send_options: &SendOptions, err: &NoSQLError) -> bool {
+        send_options.retryable
+            && send_options.retries < 4
+            && (err.code == NoSQLErrorCode::SecurityInfoUnavailable
+                || err.code == NoSQLErrorCode::RetryAuthentication
+                || err.code == NoSQLErrorCode::InvalidAuthorization)
     }
 
     async fn apply_rate_limiting(&self, send_options: &mut SendOptions) -> Result<(), NoSQLError> {
@@ -979,5 +988,74 @@ mod tests {
 
         assert!(!debug.contains("secret-session-cookie"));
         assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn internal_auth_retries_respect_send_options_retryable() {
+        let err = NoSQLError::new(
+            NoSQLErrorCode::SecurityInfoUnavailable,
+            SIU_NOT_AUTHENTICATED_MESSAGE,
+        );
+        let non_retryable = SendOptions {
+            retryable: false,
+            ..Default::default()
+        };
+
+        assert!(!Handle::should_retry_not_authenticated(
+            &non_retryable,
+            &err
+        ));
+        assert!(!Handle::should_refresh_auth_for_retry(&non_retryable, &err));
+
+        let retryable = SendOptions {
+            retryable: true,
+            ..Default::default()
+        };
+
+        assert!(Handle::should_retry_not_authenticated(&retryable, &err));
+        assert!(Handle::should_refresh_auth_for_retry(&retryable, &err));
+    }
+
+    #[test]
+    fn internal_auth_retry_limits_are_enforced() {
+        let err = NoSQLError::new(NoSQLErrorCode::InvalidAuthorization, "expired");
+
+        assert!(Handle::should_refresh_auth_for_retry(
+            &SendOptions {
+                retryable: true,
+                retries: 3,
+                ..Default::default()
+            },
+            &err
+        ));
+        assert!(!Handle::should_refresh_auth_for_retry(
+            &SendOptions {
+                retryable: true,
+                retries: 4,
+                ..Default::default()
+            },
+            &err
+        ));
+
+        let siu = NoSQLError::new(
+            NoSQLErrorCode::SecurityInfoUnavailable,
+            SIU_NOT_AUTHENTICATED_MESSAGE,
+        );
+        assert!(Handle::should_retry_not_authenticated(
+            &SendOptions {
+                retryable: true,
+                retries: 39,
+                ..Default::default()
+            },
+            &siu
+        ));
+        assert!(!Handle::should_retry_not_authenticated(
+            &SendOptions {
+                retryable: true,
+                retries: 40,
+                ..Default::default()
+            },
+            &siu
+        ));
     }
 }
