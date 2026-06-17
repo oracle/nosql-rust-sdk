@@ -76,10 +76,7 @@ impl Writer {
                 offset
             );
         }
-        let arr = val.to_be_bytes();
-        for i in 1..4 {
-            self.buf[offset + i] = arr[i];
-        }
+        self.buf[offset..offset + 4].copy_from_slice(&val.to_be_bytes());
         Ok(())
     }
 

@@ -6,6 +6,7 @@
 //
 use crate::error::ia_err;
 use crate::error::NoSQLError;
+use crate::error::NoSQLErrorCode;
 use crate::handle::Handle;
 use crate::handle::SendOptions;
 use crate::nson::*;
@@ -23,6 +24,62 @@ use std::time::Duration;
 use tracing::trace;
 
 const DRIVER_QUERY_VERSION: i32 = 6;
+
+fn is_retryable_query_statement(statement: &str) -> bool {
+    matches!(
+        first_sql_operation_keyword(statement).as_deref(),
+        Some("select")
+    )
+}
+
+fn first_sql_operation_keyword(statement: &str) -> Option<String> {
+    let (keyword, mut remaining) = split_leading_sql_keyword(statement)?;
+    let keyword = keyword.to_ascii_lowercase();
+    if keyword != "declare" {
+        return Some(keyword);
+    }
+
+    loop {
+        let declaration_end = remaining.find(';')?;
+        remaining = trim_sql_leading_noise(&remaining[declaration_end + 1..]);
+        if remaining.starts_with('$') {
+            continue;
+        }
+        return first_sql_operation_keyword(remaining);
+    }
+}
+
+fn split_leading_sql_keyword(statement: &str) -> Option<(&str, &str)> {
+    let statement = trim_sql_leading_noise(statement);
+    let end = statement
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(statement.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&statement[..end], &statement[end..]))
+}
+
+fn trim_sql_leading_noise(mut statement: &str) -> &str {
+    loop {
+        let trimmed = statement.trim_start();
+        if let Some(comment) = trimmed.strip_prefix("--") {
+            if let Some(end) = comment.find('\n') {
+                statement = &comment[end + 1..];
+                continue;
+            }
+            return "";
+        }
+        if let Some(comment) = trimmed.strip_prefix("/*") {
+            if let Some(end) = comment.find("*/") {
+                statement = &comment[end + 2..];
+                continue;
+            }
+            return "";
+        }
+        return trimmed;
+    }
+}
 
 /// Encapsulates a SQL query of a NoSQL Database table.
 ///
@@ -311,6 +368,19 @@ impl QueryRequest {
 
     fn does_writes_for_rate_limiting(&self) -> bool {
         self.prepared_statement.does_writes()
+    }
+
+    fn is_retryable(&self) -> bool {
+        if self.prepare_only {
+            return true;
+        }
+        if !self.prepared_statement.is_empty() {
+            return !self.prepared_statement.does_writes();
+        }
+        self.statement
+            .as_deref()
+            .map(is_retryable_query_statement)
+            .unwrap_or(false)
     }
 
     // used by ext_var_ref_iter
@@ -622,7 +692,7 @@ impl QueryRequest {
         let consumed_before = self.consumed_capacity;
         let mut opts = SendOptions {
             timeout: timeout,
-            retryable: true,
+            retryable: self.is_retryable(),
             compartment_id: self.compartment_id.clone(),
             table_name: self.rate_limit_table_name(),
             does_reads: true,
@@ -748,9 +818,11 @@ impl QueryRequest {
         walker.r.read_i32()?; // length of array in bytes
         let num_elements = walker.r.read_i32()?;
         trace!("read_results: num_results={}", num_elements);
-        if num_elements <= 0 {
+        let num_elements = walker.r.checked_count(num_elements, "query results")?;
+        if num_elements == 0 {
             return Ok(());
         }
+        Reader::try_reserve_vec(results, num_elements, "query results")?;
         for _i in 0..num_elements {
             if let FieldValue::Map(m) = walker.r.read_field_value()? {
                 //println!("Result: {:?}", m);
@@ -968,21 +1040,32 @@ impl QueryRequest {
         if self.prepared_statement.driver_query_plan.get_kind() == PlanIterKind::Empty {
             return Ok(());
         }
-        self.prepared_statement.num_iterators = r.read_i32()?;
+        let num_iterators = r.read_i32()?;
+        Reader::checked_count_with_limit(num_iterators, v.len(), "driver plan iterators")?;
+        self.prepared_statement.num_iterators = num_iterators;
         //println!(
         //"   QUERY_PLAN: iterators={}",
         //self.prepared_statement.num_iterators
         //);
-        self.prepared_statement.num_registers = r.read_i32()?;
+        let num_registers = r.read_i32()?;
+        Reader::checked_count_with_limit(num_registers, v.len(), "driver plan registers")?;
+        self.prepared_statement.num_registers = num_registers;
         //println!(
         //"   QUERY_PLAN: registers={}",
         //self.prepared_statement.num_registers
         //);
         let len = r.read_i32()?;
-        if len <= 0 {
+        let len = r.checked_count(len, "driver plan variables")?;
+        if len == 0 {
             return Ok(());
         }
-        let mut hm: HashMap<String, i32> = HashMap::with_capacity(len as usize);
+        let mut hm: HashMap<String, i32> = HashMap::new();
+        hm.try_reserve(len).map_err(|_| {
+            NoSQLError::new(
+                NoSQLErrorCode::BadProtocolMessage,
+                "unable to reserve decoded values for driver plan variables",
+            )
+        })?;
         for _i in 0..len {
             let name = r.read_string()?;
             let id = r.read_i32()?;
@@ -1011,29 +1094,87 @@ impl QueryRequest {
     }
 
     pub(crate) fn get_result(&mut self, reg: i32) -> FieldValue {
-        if self.num_registers <= reg {
-            panic!("INVALID GET REGISTER ACCESS");
-        }
+        let reg = self.register_index(reg, "GET");
         //println!(
         //" get_result register {}: {:?}",
         //reg, self.registers[reg as usize]
         //);
-        std::mem::take(&mut self.registers[reg as usize])
+        std::mem::take(&mut self.registers[reg])
     }
 
     pub(crate) fn get_result_ref(&self, reg: i32) -> &FieldValue {
+        let reg = self.register_index(reg, "GET");
         //println!(
         //" get_result_ref register {}: {:?}",
         //reg, self.registers[reg as usize]
         //);
-        &self.registers[reg as usize]
+        &self.registers[reg]
     }
 
     pub(crate) fn set_result(&mut self, reg: i32, val: FieldValue) {
-        if self.num_registers <= reg {
-            panic!("INVALID SET REGISTER ACCESS");
-        }
+        let reg = self.register_index(reg, "SET");
         //println!(" set_result register {}: {:?}", reg, val);
-        self.registers[reg as usize] = val;
+        self.registers[reg] = val;
+    }
+
+    fn register_index(&self, reg: i32, op: &str) -> usize {
+        if reg < 0 || self.num_registers <= reg {
+            panic!("INVALID {} REGISTER ACCESS", op);
+        }
+        reg as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_retryability_classifies_statement_text() {
+        assert!(QueryRequest::new("select * from users").is_retryable());
+        assert!(QueryRequest::new("  -- comment\n/* block */ SELECT * from users").is_retryable());
+        assert!(QueryRequest::new(
+            "declare $id integer; $name string; select * from users where id = $id"
+        )
+        .is_retryable());
+
+        assert!(!QueryRequest::new("insert into users(id) values(1)").is_retryable());
+        assert!(!QueryRequest::new("UPSERT into users(id) values(1)").is_retryable());
+        assert!(!QueryRequest::new("update users set name = 'a' where id = 1").is_retryable());
+        assert!(!QueryRequest::new("delete from users where id = 1").is_retryable());
+        assert!(!QueryRequest::new(
+            "declare $id integer; $name string; insert into users(id, name) values($id, $name)"
+        )
+        .is_retryable());
+        assert!(!QueryRequest::new("").is_retryable());
+    }
+
+    #[test]
+    fn prepare_only_queries_are_retryable_without_executing_mutation() {
+        assert!(QueryRequest::new("insert into users(id) values(1)")
+            .prepare_only()
+            .is_retryable());
+    }
+
+    #[test]
+    fn query_retryability_uses_prepared_operation_code() {
+        let mut prepared_select = PreparedStatement::default();
+        prepared_select.statement = vec![1];
+        prepared_select.operation = 5;
+        assert!(QueryRequest::new_prepared(&prepared_select).is_retryable());
+
+        let mut prepared_mutation = prepared_select.clone();
+        prepared_mutation.operation = 0;
+        assert!(!QueryRequest::new_prepared(&prepared_mutation).is_retryable());
+    }
+
+    #[test]
+    #[should_panic(expected = "INVALID GET REGISTER ACCESS")]
+    fn negative_query_register_is_rejected_before_indexing() {
+        let mut request = QueryRequest::default();
+        request.num_registers = 1;
+        request.registers.push(FieldValue::Uninitialized);
+
+        let _ = request.get_result(-1);
     }
 }

@@ -146,6 +146,48 @@ impl Reader {
         packed_integer::read_packed_i64(&mut self.buf, &mut self.offset)
     }
 
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.offset)
+    }
+
+    pub(crate) fn checked_count(&self, count: i32, context: &str) -> Result<usize, NoSQLError> {
+        Self::checked_count_with_limit(count, self.remaining(), context)
+    }
+
+    pub(crate) fn checked_count_with_limit(
+        count: i32,
+        max_count: usize,
+        context: &str,
+    ) -> Result<usize, NoSQLError> {
+        if count < 0 {
+            return Err(NoSQLError::new(
+                BadProtocolMessage,
+                format!("invalid negative count in {}", context).as_str(),
+            ));
+        }
+        let count = count as usize;
+        if count > max_count {
+            return Err(NoSQLError::new(
+                BadProtocolMessage,
+                format!("invalid count in {}", context).as_str(),
+            ));
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn try_reserve_vec<T>(
+        values: &mut Vec<T>,
+        additional: usize,
+        context: &str,
+    ) -> Result<(), NoSQLError> {
+        values.try_reserve(additional).map_err(|_| {
+            NoSQLError::new(
+                BadProtocolMessage,
+                format!("unable to reserve decoded values for {}", context).as_str(),
+            )
+        })
+    }
+
     pub fn read_string(&mut self) -> Result<String, NoSQLError> {
         let slen = packed_integer::read_packed_i32(&mut self.buf, &mut self.offset)?;
         if slen <= 0 {
@@ -297,15 +339,11 @@ impl Reader {
         let _num_bytes = self.read_i32()?;
         // number of items in the array
         let num_items = self.read_i32()?;
-        if num_items < 0 || (num_items as usize) > self.buf.len() {
-            return Err(NoSQLError::new(
-                BadProtocolMessage,
-                "invalid num_items in array message",
-            ));
-        }
+        let num_items = self.checked_count(num_items, "array message")?;
         // walk items
         //println!("read_array: num_items={}", num_items);
-        let mut arr = Vec::<FieldValue>::with_capacity(num_items as usize);
+        let mut arr = Vec::<FieldValue>::new();
+        Self::try_reserve_vec(&mut arr, num_items, "array message")?;
         for _i in 0..num_items {
             let v = self.read_field_value()?;
             //println!(" array element {}: {:?}", i, v);
@@ -327,13 +365,9 @@ impl Reader {
             return Ok(Vec::new());
         }
         let ulen = len as usize;
-        if ulen > self.buf.len() {
-            return Err(NoSQLError::new(
-                BadProtocolMessage,
-                "invalid length in string array message",
-            ));
-        }
-        let mut arr: Vec<String> = Vec::with_capacity(ulen);
+        let ulen = Self::checked_count_with_limit(ulen as i32, self.remaining(), "string array")?;
+        let mut arr: Vec<String> = Vec::new();
+        Self::try_reserve_vec(&mut arr, ulen, "string array")?;
         for _i in 0..len {
             arr.push(self.read_string()?);
         }
@@ -352,14 +386,10 @@ impl Reader {
             return Ok(Vec::new());
         }
         let ulen = len as usize;
-        if ulen > self.buf.len() {
-            return Err(NoSQLError::new(
-                BadProtocolMessage,
-                "invalid length in i32 array message",
-            ));
-        }
+        let ulen = Self::checked_count_with_limit(ulen as i32, self.remaining(), "i32 array")?;
         //println!("read_i32_array: len={}", ulen);
-        let mut arr: Vec<i32> = Vec::with_capacity(ulen);
+        let mut arr: Vec<i32> = Vec::new();
+        Self::try_reserve_vec(&mut arr, ulen, "i32 array")?;
         for _i in 0..len {
             arr.push(self.read_packed_i32()?);
         }
@@ -371,6 +401,7 @@ impl Reader {
         let _num_bytes = self.read_i32()?;
         // number of items in the map
         let num_items = self.read_i32()?;
+        let num_items = self.checked_count(num_items, "map message")?;
         // walk items
         //println!("read_map: num_items={}", num_items);
         let mut mv = MapValue::new();

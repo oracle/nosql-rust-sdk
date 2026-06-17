@@ -240,16 +240,19 @@ pub fn write_packed_i64(v: &mut Vec<u8>, val: i64) {
     v.push((i + 127) as u8);
 }
 
-// check that the offset will not run off the end of the vector, then
-// increment it.
-fn increment_and_check(offset: &mut usize, len: usize) -> Result<(), NoSQLError> {
-    if *offset >= len {
+fn validate_packed_len(
+    buf_len: usize,
+    offset: usize,
+    value_len: usize,
+    max_len: usize,
+    type_name: &str,
+) -> Result<(), NoSQLError> {
+    if value_len > max_len || buf_len.saturating_sub(offset) < value_len {
         return Err(NoSQLError::new(
             BadProtocolMessage,
-            "attempt to read past end of buffer",
+            format!("invalid {} in buffer", type_name).as_str(),
         ));
     }
-    *offset += 1;
     Ok(())
 }
 
@@ -263,7 +266,7 @@ pub fn read_packed_i32(buf: &mut Vec<u8>, offset: &mut usize) -> Result<i32, NoS
     }
     // The first byte stores the length of the value part.
     let mut len: u8 = buf[*offset];
-    increment_and_check(offset, buf.len())?;
+    *offset += 1;
 
     let mut is_negative: bool = false;
 
@@ -277,6 +280,9 @@ pub fn read_packed_i32(buf: &mut Vec<u8>, offset: &mut usize) -> Result<i32, NoS
         return Ok((len as i32) - 127);
     }
 
+    let value_len = len as usize;
+    validate_packed_len(buf.len(), *offset, value_len, 4, "packed_i32")?;
+
     // The following bytes on the buf store the value as a big endian integer.
     // We extract the significant bytes from the buf and put them into the
     // value in big endian order.
@@ -285,13 +291,10 @@ pub fn read_packed_i32(buf: &mut Vec<u8>, offset: &mut usize) -> Result<i32, NoS
         value = -1; // 0xFFFFFFFF
     }
 
-    while len > 1 {
+    for _ in 0..value_len {
         value = (value << 8) | (buf[*offset] as i32);
-        increment_and_check(offset, buf.len())?;
-        len -= 1;
+        *offset += 1;
     }
-    value = (value << 8) | (buf[*offset] as i32);
-    increment_and_check(offset, buf.len())?;
 
     // After get the adjusted value, we have to adjust it back to the
     // original value.
@@ -313,7 +316,7 @@ pub fn read_packed_i64(buf: &mut Vec<u8>, offset: &mut usize) -> Result<i64, NoS
     }
     // The first byte stores the length of the value part.
     let mut len: u8 = buf[*offset];
-    increment_and_check(offset, buf.len())?;
+    *offset += 1;
 
     let mut is_negative: bool = false;
 
@@ -327,6 +330,9 @@ pub fn read_packed_i64(buf: &mut Vec<u8>, offset: &mut usize) -> Result<i64, NoS
         return Ok((len as i64) - 127);
     }
 
+    let value_len = len as usize;
+    validate_packed_len(buf.len(), *offset, value_len, 8, "packed_i64")?;
+
     // The following bytes on the buf store the value as a big endian integer.
     // We extract the significant bytes from the buf and put them into the
     // value in big endian order.
@@ -335,13 +341,10 @@ pub fn read_packed_i64(buf: &mut Vec<u8>, offset: &mut usize) -> Result<i64, NoS
         value = -1; // 0xFFFFFFFFFFFFFFFF
     }
 
-    while len > 1 {
+    for _ in 0..value_len {
         value = (value << 8) | (buf[*offset] as i64);
-        increment_and_check(offset, buf.len())?;
-        len -= 1;
+        *offset += 1;
     }
-    value = (value << 8) | (buf[*offset] as i64);
-    increment_and_check(offset, buf.len())?;
 
     // After get the adjusted value, we have to adjust it back to the
     // original value.

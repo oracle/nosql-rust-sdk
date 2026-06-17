@@ -92,6 +92,7 @@ impl GetIndexesRequest {
             timeout: timeout,
             retryable: true,
             compartment_id: self.compartment_id.clone(),
+            namespace: self.namespace.clone(),
             ..Default::default()
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
@@ -108,9 +109,9 @@ impl GetIndexesRequest {
         // payload
         ns.start_payload();
         ns.write_string_field(INDEX, &self.index_name);
+        ns.write_nonempty_string_field(NAMESPACE, &self.namespace);
         // TODO: these are currently only in http headers. Add to NSON?
         //ns.write_string_field(COMPARTMENT_OCID, &self.compartment_id);
-        //ns.write_string_field(NAMESPACE, &self.namespace);
         ns.end_payload();
 
         ns.end_request();
@@ -131,14 +132,10 @@ impl GetIndexesRequest {
                     MapWalker::expect_type(walker.r, FieldType::Array)?;
                     let _ = walker.r.read_i32()?; // skip array size in bytes
                     let num_elements = walker.r.read_i32()?;
-                    if num_elements < 0 || (num_elements as usize) > walker.r.buf.len() {
-                        return Err(NoSQLError::new(
-                            BadProtocolMessage,
-                            "invalid num_elements in index array",
-                        ));
-                    }
-                    res.indexes = Vec::with_capacity(num_elements as usize);
-                    for _n in 1..=num_elements {
+                    let num_elements = walker.r.checked_count(num_elements, "index array")?;
+                    res.indexes = Vec::new();
+                    Reader::try_reserve_vec(&mut res.indexes, num_elements, "index array")?;
+                    for _n in 0..num_elements {
                         res.indexes
                             .push(GetIndexesRequest::read_index_info(walker.r)?);
                     }
@@ -168,15 +165,12 @@ impl GetIndexesRequest {
                     MapWalker::expect_type(walker.r, FieldType::Array)?;
                     let _ = walker.r.read_i32()?; // skip array size in bytes
                     let num_elements = walker.r.read_i32()?;
-                    if num_elements < 0 || (num_elements as usize) > walker.r.buf.len() {
-                        return Err(NoSQLError::new(
-                            BadProtocolMessage,
-                            "invalid num_elements in fields array",
-                        ));
-                    }
-                    res.field_names = Vec::with_capacity(num_elements as usize);
-                    res.field_types = Vec::with_capacity(num_elements as usize);
-                    for _n in 1..=num_elements {
+                    let num_elements = walker.r.checked_count(num_elements, "fields array")?;
+                    res.field_names = Vec::new();
+                    res.field_types = Vec::new();
+                    Reader::try_reserve_vec(&mut res.field_names, num_elements, "fields array")?;
+                    Reader::try_reserve_vec(&mut res.field_types, num_elements, "fields array")?;
+                    for _n in 0..num_elements {
                         GetIndexesRequest::read_index_fields(walker.r, &mut res)?;
                     }
                 }

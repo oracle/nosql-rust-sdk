@@ -6,7 +6,6 @@
 //
 use crate::delete_request::DeleteRequest;
 use crate::error::NoSQLError;
-use crate::error::NoSQLErrorCode::BadProtocolMessage;
 use crate::error::NoSQLErrorCode::IllegalArgument;
 use crate::handle::Handle;
 use crate::handle::SendOptions;
@@ -300,14 +299,10 @@ impl WriteMultipleRequest {
                     MapWalker::expect_type(walker.r, FieldType::Array)?;
                     let _ = walker.r.read_i32()?; // skip array size in bytes
                     let num_elements = walker.r.read_i32()?;
-                    if num_elements < 0 || (num_elements as usize) > walker.r.buf.len() {
-                        return Err(NoSQLError::new(
-                            BadProtocolMessage,
-                            "invalid num_elements in results array",
-                        ));
-                    }
-                    res.results = Vec::with_capacity(num_elements as usize);
-                    for _n in 1..=num_elements {
+                    let num_elements = walker.r.checked_count(num_elements, "results array")?;
+                    res.results = Vec::new();
+                    Reader::try_reserve_vec(&mut res.results, num_elements, "results array")?;
+                    for _n in 0..num_elements {
                         res.results
                             .push(WriteMultipleRequest::read_result(walker.r)?);
                     }

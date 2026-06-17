@@ -45,7 +45,9 @@ impl SortSpec {
         if num <= 0 {
             return Ok(Vec::new());
         }
-        let mut v: Vec<SortSpec> = Vec::with_capacity(num as usize);
+        let num = r.checked_count(num, "sort specs")?;
+        let mut v: Vec<SortSpec> = Vec::new();
+        Reader::try_reserve_vec(&mut v, num, "sort specs")?;
         for _i in 0..num {
             v.push(SortSpec::from_reader(r)?);
         }

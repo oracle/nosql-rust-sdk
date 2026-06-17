@@ -102,19 +102,43 @@ fn test_rw_with_offsets() -> Result<(), Box<dyn Error>> {
     let offset2 = writer.size();
     writer.write_i32(0);
     writer.write_packed_i32(98765);
-    writer.write_i32_at_offset(6543, offset1)?;
-    writer.write_i32_at_offset(1111, offset2)?;
+    writer.write_i32_at_offset(0x1234567, offset1)?;
+    writer.write_i32_at_offset(0x7f000001, offset2)?;
 
     let mut reader = Reader::new().from_bytes(writer.bytes());
     assert_eq!(reader.read_i32()?, 1234567);
     assert_eq!(reader.read_i16()?, 120);
     assert_eq!(reader.read_packed_i32()?, 545454);
-    assert_eq!(reader.read_i32()?, 6543);
+    assert_eq!(reader.read_i32()?, 0x1234567);
     assert_eq!(reader.read_packed_i64()?, 98765432198765);
     assert_eq!(reader.read_i32()?, 1);
     assert_eq!(reader.read_i16()?, 200);
     assert_eq!(reader.read_packed_i32()?, 222222);
-    assert_eq!(reader.read_i32()?, 1111);
+    assert_eq!(reader.read_i32()?, 0x7f000001);
     assert_eq!(reader.read_packed_i32()?, 98765);
     Ok(())
+}
+
+#[test]
+fn test_truncated_packed_integers_return_errors() {
+    let mut reader = Reader::new().from_bytes(&[0xf8]);
+    assert!(reader.read_packed_i32().is_err());
+
+    let mut reader = Reader::new().from_bytes(&[0xf8]);
+    assert!(reader.read_packed_i64().is_err());
+
+    let mut reader = Reader::new().from_bytes(&[0x03, 0, 0, 0, 0, 0]);
+    assert!(reader.read_packed_i32().is_err());
+}
+
+#[test]
+fn test_malformed_collection_counts_return_errors() {
+    let mut reader = Reader::new().from_bytes(&[0, 0, 0, 0, 0, 0, 0, 1]);
+    assert!(reader.read_array().is_err());
+
+    let mut reader = Reader::new().from_bytes(&[0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+    assert!(reader.read_map().is_err());
+
+    let mut reader = Reader::new().from_bytes(&[0, 0, 0, 0, 0, 0, 0, 1]);
+    assert!(reader.read_map().is_err());
 }

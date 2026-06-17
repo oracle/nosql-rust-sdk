@@ -4,10 +4,16 @@
 // Licensed under the Universal Permissive License v 1.0 as shown at
 //  https://oss.oracle.com/licenses/upl/
 //
+use crate::delete_request::*;
+use crate::get_indexes_request::*;
 use crate::get_request::*;
+use crate::list_tables_request::*;
 use crate::multi_delete_request::*;
 use crate::put_request::*;
 use crate::system_request::*;
+use crate::table_request::*;
+use crate::table_usage_request::*;
+use crate::write_multiple_request::*;
 use crate::{nson::*, reader::Reader, types::*, writer::Writer};
 use std::error::Error;
 use std::time::Duration;
@@ -108,6 +114,52 @@ fn test_multi_delete_request_field_range() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn test_write_multiple_delete_subrequest_serializes_map() -> Result<(), Box<dyn Error>> {
+    let timeout = Duration::from_millis(30000);
+    let delete =
+        DeleteRequest::new("testusers", MapValue::new().i32("id", 42)).set_abort_on_fail(true);
+    let request = WriteMultipleRequest::new("testusers").add(Box::new(delete));
+    let mut w = Writer::new();
+    do_serialize(&request, &mut w, &timeout);
+
+    let mut reader = Reader::new().from_bytes(w.bytes());
+    let request = reader.read_field_value()?.get_map_value()?;
+    let payload = request.get_map(PAYLOAD).ok_or("payload missing")?;
+    assert_eq!(payload.get_i32(NUM_OPERATIONS), Some(1));
+
+    let operations = payload.get_array(OPERATIONS).ok_or("operations missing")?;
+    assert_eq!(operations.len(), 1);
+    let operation = operations[0].get_map_value_ref()?;
+
+    assert_eq!(operation.get_i32(OP_CODE), Some(OpCode::Delete as i32));
+    assert_eq!(operation.get_bool(ABORT_ON_FAIL), Some(true));
+    assert_eq!(operation.get_bool(RETURN_ROW), Some(true));
+    let key = operation.get_map(KEY).ok_or("key missing")?;
+    assert_eq!(key.get_i32("id"), Some(42));
+
+    Ok(())
+}
+
+#[test]
+fn test_table_usage_request_serializes_start_index() -> Result<(), Box<dyn Error>> {
+    let timeout = Duration::from_millis(30000);
+    let request = TableUsageRequest::new("testusers")
+        .limit(10)
+        .start_index(25);
+    let mut w = Writer::new();
+    do_serialize(&request, &mut w, &timeout);
+
+    let mut reader = Reader::new().from_bytes(w.bytes());
+    let request = reader.read_field_value()?.get_map_value()?;
+    let payload = request.get_map(PAYLOAD).ok_or("payload missing")?;
+
+    assert_eq!(payload.get_i32(LIST_MAX_TO_READ), Some(10));
+    assert_eq!(payload.get_i32(LIST_START_INDEX), Some(25));
+
+    Ok(())
+}
+
 fn serialized_op_code(r: &dyn NsonRequest, timeout: &Duration) -> Result<i32, Box<dyn Error>> {
     let mut w = Writer::new();
     do_serialize(r, &mut w, timeout);
@@ -116,6 +168,19 @@ fn serialized_op_code(r: &dyn NsonRequest, timeout: &Duration) -> Result<i32, Bo
     let request = reader.read_field_value()?.get_map_value()?;
     let header = request.get_map(HEADER).ok_or("header missing")?;
     header.get_i32(OP_CODE).ok_or("op code missing".into())
+}
+
+fn serialized_payload_namespace(
+    r: &dyn NsonRequest,
+    timeout: &Duration,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let mut w = Writer::new();
+    do_serialize(r, &mut w, timeout);
+
+    let mut reader = Reader::new().from_bytes(w.bytes());
+    let request = reader.read_field_value()?.get_map_value()?;
+    let payload = request.get_map(PAYLOAD).ok_or("payload missing")?;
+    Ok(payload.get_string(NAMESPACE))
 }
 
 #[test]
@@ -132,6 +197,73 @@ fn test_system_request_op_codes() -> Result<(), Box<dyn Error>> {
 
     let status_request = SystemStatusRequest::new("operation-1");
     assert_eq!(serialized_op_code(&status_request, &timeout)?, 24);
+
+    Ok(())
+}
+
+#[test]
+fn test_table_metadata_requests_serialize_namespace() -> Result<(), Box<dyn Error>> {
+    let timeout = Duration::from_millis(30000);
+
+    let table_request = TableRequest::new("testusers")
+        .statement("create table testusers(id integer, primary key(id))")
+        .namespace("testns");
+    assert_eq!(
+        serialized_payload_namespace(&table_request, &timeout)?,
+        Some("testns".to_string())
+    );
+
+    let get_table_request = GetTableRequest::new("testusers")
+        .operation_id("operation-1")
+        .namespace("testns");
+    assert_eq!(
+        serialized_payload_namespace(&get_table_request, &timeout)?,
+        Some("testns".to_string())
+    );
+
+    let list_tables_request = ListTablesRequest::new().namespace("testns");
+    assert_eq!(
+        serialized_payload_namespace(&list_tables_request, &timeout)?,
+        Some("testns".to_string())
+    );
+
+    let get_indexes_request = GetIndexesRequest::new("testusers").namespace("testns");
+    assert_eq!(
+        serialized_payload_namespace(&get_indexes_request, &timeout)?,
+        Some("testns".to_string())
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_table_metadata_requests_omit_empty_namespace() -> Result<(), Box<dyn Error>> {
+    let timeout = Duration::from_millis(30000);
+
+    let table_request = TableRequest::new("testusers")
+        .statement("create table testusers(id integer, primary key(id))");
+    assert_eq!(
+        serialized_payload_namespace(&table_request, &timeout)?,
+        None
+    );
+
+    let get_table_request = GetTableRequest::new("testusers").operation_id("operation-1");
+    assert_eq!(
+        serialized_payload_namespace(&get_table_request, &timeout)?,
+        None
+    );
+
+    let list_tables_request = ListTablesRequest::new();
+    assert_eq!(
+        serialized_payload_namespace(&list_tables_request, &timeout)?,
+        None
+    );
+
+    let get_indexes_request = GetIndexesRequest::new("testusers");
+    assert_eq!(
+        serialized_payload_namespace(&get_indexes_request, &timeout)?,
+        None
+    );
 
     Ok(())
 }

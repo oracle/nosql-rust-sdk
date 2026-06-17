@@ -172,6 +172,7 @@ impl TableRequest {
             timeout: timeout,
             retryable: false,
             compartment_id: self.compartment_id.clone(),
+            namespace: self.namespace.clone(),
             ..Default::default()
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
@@ -199,9 +200,9 @@ impl TableRequest {
         if let Some(etag) = &self.match_etag {
             ns.write_string_field(ETAG, etag);
         }
+        ns.write_nonempty_string_field(NAMESPACE, &self.namespace);
         // TODO: these are currently only in http headers. Add to NSON?
         //ns.write_string_field(COMPARTMENT_OCID, &self.compartment_id);
-        //ns.write_string_field(NAMESPACE, &self.namespace);
         ns.end_payload();
 
         ns.end_request();
@@ -350,9 +351,9 @@ impl GetTableRequest {
         if !self.operation_id.is_empty() {
             ns.write_string_field(OPERATION_ID, &self.operation_id);
         }
+        ns.write_nonempty_string_field(NAMESPACE, &self.namespace);
         // TODO: these are currently only in http headers. Add to NSON?
         //ns.write_string_field(COMPARTMENT_OCID, &self.compartment_id);
-        //ns.write_string_field(NAMESPACE, &self.namespace);
         ns.end_payload();
 
         ns.end_request();
