@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 
 ### Prerequisites
-- Rust 1.78 or later
+- Rust 1.88 or later
   - Download and install a [Rust](https://www.rust-lang.org/tools/install) binary release suitable for your system. See the install and setup instructions on that page.
 - Oracle NoSQL Database. Use one of the options:
   - Subscribe to the [Oracle NoSQL Database Cloud Service](https://www.oracle.com/database/nosql-cloud.html).
