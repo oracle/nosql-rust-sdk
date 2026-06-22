@@ -8,7 +8,7 @@
 use oracle_nosql_rust_sdk::types::{MapValue, NoSQLColumnToFieldValue, TableLimits};
 use oracle_nosql_rust_sdk::{
     DeleteRequest, GetIndexesRequest, GetRequest, GetTableRequest, Handle, HandleMode,
-    ListTablesRequest, MultiDeleteRequest, NoSQLError, PutRequest, QueryRequest,
+    ListTablesRequest, MultiDeleteRequest, NoSQLError, NoSQLErrorCode, PutRequest, QueryRequest,
     StatsPercentileMode, StatsProfile, StatsSnapshot, TableRequest, WriteMultipleRequest,
 };
 use serde_json::Value;
@@ -99,7 +99,14 @@ async fn e2e_stats_match_independent_workload_metrics() -> Result<(), Box<dyn Er
     handle.get_stats_control().stop();
     let cleanup = drop_table(&handle, &table_name).await;
 
-    validation?;
+    if let Err(error) = validation {
+        cleanup?;
+        if is_unsupported_query_protocol(error.as_ref()) {
+            println!("skipping live stats e2e: endpoint does not support the current SDK query protocol ({error})");
+            return Ok(());
+        }
+        return Err(error);
+    }
     cleanup?;
 
     Ok(())
@@ -176,10 +183,24 @@ async fn e2e_all_profile_query_requests_create_query_entries() -> Result<(), Box
     handle.get_stats_control().stop();
     let cleanup = drop_table(&handle, &table_name).await;
 
-    validation?;
+    if let Err(error) = validation {
+        cleanup?;
+        if is_unsupported_query_protocol(error.as_ref()) {
+            println!("skipping live ALL-profile query e2e: endpoint does not support the current SDK query protocol ({error})");
+            return Ok(());
+        }
+        return Err(error);
+    }
     cleanup?;
 
     Ok(())
+}
+
+fn is_unsupported_query_protocol(error: &(dyn Error + 'static)) -> bool {
+    error.downcast_ref::<NoSQLError>().is_some_and(|error| {
+        error.code == NoSQLErrorCode::BadProtocolMessage
+            && error.message.contains("Invalid query version")
+    })
 }
 
 fn test_mode() -> TestMode {
