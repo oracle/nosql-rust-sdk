@@ -622,13 +622,33 @@ fn assert_request_metrics_match(
         "{name} SDK count must match independently measured count"
     );
 
+    println!("{name}: count={}", sdk.count);
+    let Some(latency) = &sdk.latency else {
+        if independent.max_ms() == 0 {
+            println!(
+                "{name:<14} {:<14} expected=omitted   actual=omitted   good",
+                "latency"
+            );
+            println!();
+            return Ok(());
+        }
+        return Err(format!("{name} is missing httpRequestLatencyMs").into());
+    };
+
     let comparisons = [
-        ("avg", independent.avg_ms(), sdk.avg_ms),
-        ("95th", independent.percentile_ms(0.95) as f64, sdk.p95_ms),
-        ("99th", independent.percentile_ms(0.99) as f64, sdk.p99_ms),
+        ("avg", independent.avg_ms(), latency.avg_ms),
+        (
+            "95th",
+            independent.percentile_ms(0.95) as f64,
+            latency.p95_ms,
+        ),
+        (
+            "99th",
+            independent.percentile_ms(0.99) as f64,
+            latency.p99_ms,
+        ),
     ];
 
-    println!("{name}: count={}", sdk.count);
     for (field, expected, actual) in comparisons {
         let matches = latency_matches(expected, actual, tolerance);
         println!(
@@ -677,13 +697,8 @@ fn sdk_metrics_from_snapshot(
         if count == 0 {
             continue;
         }
-        let latency = request
-            .get("httpRequestLatencyMs")
-            .ok_or_else(|| format!("{name} is missing httpRequestLatencyMs"))?;
-        metrics.insert(
-            name.to_string(),
-            SdkRequestMetrics {
-                count,
+        let latency = match request.get("httpRequestLatencyMs") {
+            Some(latency) => Some(SdkLatencyMetrics {
                 avg_ms: latency["avg"]
                     .as_f64()
                     .ok_or_else(|| format!("{name} avg latency is missing"))?,
@@ -695,8 +710,10 @@ fn sdk_metrics_from_snapshot(
                     .as_u64()
                     .ok_or_else(|| format!("{name} p99 latency is missing"))?
                     as f64,
-            },
-        );
+            }),
+            None => None,
+        };
+        metrics.insert(name.to_string(), SdkRequestMetrics { count, latency });
     }
     Ok(metrics)
 }
@@ -778,6 +795,10 @@ impl IndependentRequestMetrics {
         self.samples_ms.iter().sum::<u64>() as f64 / self.samples_ms.len() as f64
     }
 
+    fn max_ms(&self) -> u64 {
+        self.samples_ms.iter().copied().max().unwrap_or(0)
+    }
+
     fn percentile_ms(&self, percentile: f64) -> u64 {
         exact_percentile_ms(&self.samples_ms, percentile)
     }
@@ -786,6 +807,11 @@ impl IndependentRequestMetrics {
 #[derive(Debug)]
 struct SdkRequestMetrics {
     count: u64,
+    latency: Option<SdkLatencyMetrics>,
+}
+
+#[derive(Debug)]
+struct SdkLatencyMetrics {
     avg_ms: f64,
     p95_ms: f64,
     p99_ms: f64,

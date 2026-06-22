@@ -554,6 +554,13 @@ impl QueryRequest {
         }
     }
 
+    fn validate_query_input_for_stats(&self) -> Result<(), NoSQLError> {
+        if self.statement.is_none() && self.prepared_statement.is_empty() {
+            return ia_err!("no statement or prepared statement");
+        }
+        Ok(())
+    }
+
     /// Set a named bind variable for execution of a prepared query.
     ///
     /// See [`PreparedStatement`] for an example of using this method.
@@ -618,17 +625,12 @@ impl QueryRequest {
         let mut iter_data = ReceiveIterData::default();
         let mut results: Vec<MapValue> = Vec::new();
         self.reset()?;
-        if !self.is_internal && !self.prepare_only {
-            // Logical query stats are counted once per user-level query
-            // execution, separately from the HTTP request count.
-            h.inner
-                .stats_control
-                .observe_query(self.query_stats_metadata());
-        }
+        let mut observe_logical_query = !self.is_internal && !self.prepare_only;
         while self.is_done == false {
             //println!("execute_internal doing next batch");
-            self.execute_batch_internal(h, &mut results, &mut iter_data)
+            self.execute_batch_internal(h, &mut results, &mut iter_data, observe_logical_query)
                 .await?;
+            observe_logical_query = false;
             self.batch_counter += 1;
             if self.batch_counter > 10000 {
                 panic!("Batch_internal infinite loop detected: self={:?}", self);
@@ -663,15 +665,8 @@ impl QueryRequest {
         results: &mut Vec<MapValue>,
     ) -> Result<(), NoSQLError> {
         let mut _data = ReceiveIterData::default();
-        if !self.is_internal && !self.prepare_only {
-            // Batch execution is also a logical query execution from the
-            // caller's point of view, matching Java's ALL-profile query stats.
-            handle
-                .inner
-                .stats_control
-                .observe_query(self.query_stats_metadata());
-        }
-        self.execute_batch_internal(handle, results, &mut _data)
+        let observe_logical_query = !self.is_internal && !self.prepare_only;
+        self.execute_batch_internal(handle, results, &mut _data, observe_logical_query)
             .await
     }
 
@@ -689,6 +684,7 @@ impl QueryRequest {
         handle: &Handle,
         results: &mut Vec<MapValue>,
         iter_data: &mut ReceiveIterData,
+        observe_logical_query: bool,
     ) -> Result<(), NoSQLError> {
         trace!(
             "EBI: batch_counter={} num_results={}",
@@ -697,6 +693,16 @@ impl QueryRequest {
         );
 
         self.reached_limit = false;
+        if observe_logical_query {
+            self.validate_query_input_for_stats()?;
+            // Java records the logical query call after local validation but
+            // before the request goes on the wire, so network failures still
+            // count while malformed local requests do not.
+            handle
+                .inner
+                .stats_control
+                .observe_query(self.query_stats_metadata());
+        }
 
         // internal queries do not use plan iterators/etc - they just return plain results.
         if self.is_internal == false {
@@ -1347,7 +1353,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn execute_batch_counts_each_public_batch_call_as_logical_query(
+    async fn execute_batch_rejects_invalid_request_without_query_stats(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let handle = Handle::builder()
             .endpoint("http://localhost:8080")?
@@ -1360,9 +1366,8 @@ mod tests {
         let mut request = QueryRequest::default();
         let mut results = Vec::new();
 
-        // The intentionally invalid request fails during local serialization,
-        // after execute_batch() has counted the public logical query call but
-        // before any HTTP request is attempted.
+        // Java validates query input before observeQuery(), so malformed local
+        // requests must not create an ALL-profile logical query entry.
         assert!(request.execute_batch(&handle, &mut results).await.is_err());
         assert!(request.execute_batch(&handle, &mut results).await.is_err());
 
@@ -1374,12 +1379,45 @@ mod tests {
                 .as_json(),
         )?;
 
-        let query = query_entry(&snapshot, "null").unwrap();
-        assert_eq!(query["query"], "null");
+        assert!(snapshot.get("queries").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_batch_counts_each_valid_public_batch_attempt_as_logical_query(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let handle = Handle::builder()
+            .endpoint("http://127.0.0.1:9")?
+            .mode(HandleMode::Cloudsim)?
+            .timeout(Duration::from_millis(50))?
+            .stats_profile(StatsProfile::All)?
+            .stats_enable_log(false)?
+            .build()
+            .await?;
+
+        let mut request = QueryRequest::new("select * from users");
+        let mut results = Vec::new();
+
+        // The request is locally valid, so each public execute_batch() attempt
+        // counts as a logical query even when the local test endpoint is absent.
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+
+        let snapshot: Value = serde_json::from_str(
+            handle
+                .get_stats_control()
+                .emit_interval_for_test()
+                .unwrap()
+                .as_json(),
+        )?;
+
+        let query = query_entry(&snapshot, "select * from users").unwrap();
+        assert_eq!(query["query"], "select * from users");
         assert_eq!(query["count"], 2);
         assert_eq!(query["unprepared"], 2);
-        assert_eq!(query["httpRequestCount"], 0);
-        assert_eq!(query["errors"], 0);
+        assert_eq!(query["httpRequestCount"], 2);
+        assert_eq!(query["errors"], 2);
         assert_eq!(query["simple"], false);
 
         Ok(())
