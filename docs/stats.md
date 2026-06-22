@@ -22,8 +22,10 @@ This document is for maintainers and reviewers. User-facing setup lives in
 ## Files Involved
 
 - `src/stats.rs`: public stats types, runtime control, aggregation,
-  percentile calculation, Java-style JSON serialization, and core stats unit
-  tests.
+  percentile calculation, and Java-style JSON serialization.
+- `src/stats_unit_tests.rs`: focused unit tests for stats profiles, runtime
+  control, aggregation, JSON shape, percentile behavior, and query stats
+  invariants.
 - `src/handle_builder.rs`: builder configuration and environment-variable
   parsing for stats profile, interval, pretty print, logging, handler, and
   percentile mode.
@@ -46,8 +48,9 @@ This document is for maintainers and reviewers. User-facing setup lives in
   schema shape, profile behavior, deterministic counters, errors, throttling
   fields, and latency field presence.
 - `tests/stats_e2e_tests.rs`: opt-in end-to-end test that sends real SDK
-  `Put`, `Get`, and `Query` requests and validates stats counts, average
-  latency range, and p95 presence.
+  metadata, DDL, CRUD, write-multiple, multi-delete, prepare, and query
+  requests, independently computes throughput plus average, p95, and p99
+  latency, and compares those values with SDK stats.
 - `examples/stats`: compact usage example.
 - `examples/stats_profile_output_demo`: Java-comparison demo for one selected
   profile.
@@ -300,18 +303,22 @@ be revisited.
 
 ## Tests
 
-Run the baseline library checks with the known QTF baseline skipped:
+Run the baseline library checks with setup-dependent tests skipped:
 
 ```sh
 cargo fmt --check
-cargo check
-cargo test --lib -- --skip qtf_test
+git diff --check
+cargo test --lib --all-features -- --skip qtf_test --skip region::test_region_lookup
 ```
 
 Run stats functional tests with expected/actual output:
 
 ```sh
-cargo test --lib stats::functional_tests -- --nocapture --skip qtf_test
+cargo test --lib --all-features stats::functional_tests -- --nocapture
+cargo test --lib --all-features stats::tests -- --nocapture
+cargo test --test stats_e2e_tests -- --nocapture
+cargo test --doc --all-features
+cargo check --examples
 ```
 
 These tests validate:
@@ -421,3 +428,6 @@ When reviewing stats changes, check:
   show `0ms`.
 - HDR percentile mode is approximate by design.
 - The E2E stats test requires a running CloudSim/proxy and is therefore opt-in.
+- Full live query validation requires a CloudSim/proxy that supports the SDK's
+  current query protocol. Older CloudSim versions may report a clear skip for
+  the live query workload instead of validating query stats.
