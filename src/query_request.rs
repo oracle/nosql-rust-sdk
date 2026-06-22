@@ -1229,7 +1229,7 @@ impl QueryRequest {
 }
 
 #[cfg(test)]
-mod tests {
+mod retryability_tests {
     use super::*;
 
     #[test]

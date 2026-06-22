@@ -831,7 +831,7 @@ impl HandleBuilder {
 }
 
 #[cfg(test)]
-mod tests {
+mod stats_env_tests {
     use super::*;
 
     #[test]
