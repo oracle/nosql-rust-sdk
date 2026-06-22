@@ -11,8 +11,6 @@ use crate::types::{FieldValue, TopologyInfo};
 use std::collections::HashMap;
 use std::result::Result;
 
-const OPCODE_SELECT: u8 = 5;
-
 /// A prepared query statement for use in a [`QueryRequest`](crate::QueryRequest).
 ///
 /// PreparedStatement encapsulates a prepared query statement. It includes state
@@ -151,6 +149,29 @@ impl Clone for PreparedStatementData {
 }
 
 impl PreparedStatement {
+    const OPCODE_SELECT: u8 = 5;
+
+    pub(crate) fn sql_text(&self) -> &str {
+        &self.sql_text
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn query_plan(&self) -> &str {
+        &self.query_plan
+    }
+
+    pub(crate) fn is_simple_query(&self) -> bool {
+        self.is_simple()
+    }
+
+    pub(crate) fn print_driver_plan(&self) -> Option<String> {
+        if self.is_simple() {
+            None
+        } else {
+            Some(format!("{:?}", self.driver_query_plan))
+        }
+    }
+
     pub(crate) fn is_simple(&self) -> bool {
         self.driver_query_plan.get_kind() == PlanIterKind::Empty
     }
@@ -158,7 +179,7 @@ impl PreparedStatement {
         self.statement.len() == 0
     }
     pub(crate) fn does_writes(&self) -> bool {
-        !self.is_empty() && self.operation != OPCODE_SELECT
+        !self.is_empty() && self.operation != Self::OPCODE_SELECT
     }
     // set iterators/etc to their initial values, as if
     // they had just been deserialized
@@ -193,7 +214,9 @@ impl PreparedStatement {
         };
 
         PreparedStatement {
-            // Keep the binary statement plus metadata needed for rate limiting.
+            sql_text: self.sql_text.clone(),
+            query_plan: self.query_plan.clone(),
+            query_schema: self.query_schema.clone(),
             statement,
             table_name,
             namespace,
@@ -201,6 +224,10 @@ impl PreparedStatement {
             data: data,
             ..Default::default()
         }
+    }
+
+    pub(crate) fn set_sql_text(&mut self, sql_text: &str) {
+        self.sql_text = sql_text.to_string();
     }
 
     pub(crate) fn set_variable(

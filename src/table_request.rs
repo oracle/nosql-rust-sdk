@@ -171,6 +171,7 @@ impl TableRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: false,
+            request_name: "Table",
             compartment_id: self.compartment_id.clone(),
             namespace: self.namespace.clone(),
             ..Default::default()
@@ -325,6 +326,7 @@ impl GetTableRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: true,
+            request_name: "GetTable",
             compartment_id: self.compartment_id.clone(),
             namespace: self.namespace.clone(),
             ..Default::default()
@@ -348,10 +350,8 @@ impl GetTableRequest {
 
         // payload
         ns.start_payload();
-        if !self.operation_id.is_empty() {
-            ns.write_string_field(OPERATION_ID, &self.operation_id);
-        }
         ns.write_nonempty_string_field(NAMESPACE, &self.namespace);
+        ns.write_nonempty_string_field(OPERATION_ID, &self.operation_id);
         // TODO: these are currently only in http headers. Add to NSON?
         //ns.write_string_field(COMPARTMENT_OCID, &self.compartment_id);
         ns.end_payload();
@@ -508,5 +508,55 @@ impl TableResult {
             return Some(etag.clone());
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serialized_get_table_payload_fields(request: &GetTableRequest) -> Vec<String> {
+        let mut writer = Writer::new();
+        request.nson_serialize(&mut writer, &Duration::from_secs(30));
+        let mut reader = Reader::new().from_bytes(writer.bytes());
+        let mut root = MapWalker::new(&mut reader).unwrap();
+
+        while root.has_next() {
+            root.next().unwrap();
+            let name = root.current_name().clone();
+            if name != PAYLOAD {
+                root.skip_nson_field().unwrap();
+                continue;
+            }
+
+            let mut payload = MapWalker::new(root.r).unwrap();
+            let mut fields = Vec::new();
+            while payload.has_next() {
+                payload.next().unwrap();
+                fields.push(payload.current_name().clone());
+                payload.skip_nson_field().unwrap();
+            }
+            return fields;
+        }
+
+        panic!("serialized get-table request did not contain payload");
+    }
+
+    fn contains_field(fields: &[String], field: &str) -> bool {
+        fields.iter().any(|name| name == field)
+    }
+
+    #[test]
+    fn get_table_serialize_omits_empty_operation_id() {
+        let fields =
+            serialized_get_table_payload_fields(&GetTableRequest::new("users").operation_id(""));
+
+        assert!(!contains_field(&fields, OPERATION_ID));
+
+        let fields = serialized_get_table_payload_fields(
+            &GetTableRequest::new("users").operation_id("operation-1"),
+        );
+
+        assert!(contains_field(&fields, OPERATION_ID));
     }
 }

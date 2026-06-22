@@ -347,6 +347,7 @@ impl PutRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: false,
+            request_name: "Put",
             compartment_id: self.compartment_id.clone(),
             table_name: self.table_name.clone(),
             does_reads: self.does_reads(),

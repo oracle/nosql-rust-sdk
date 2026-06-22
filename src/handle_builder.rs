@@ -21,6 +21,7 @@ use crate::auth_common::instance_principal_auth_provider::InstancePrincipalAuthP
 use crate::auth_common::resource_principal_auth_provider::ResourcePrincipalAuthProvider;
 use crate::error::{ia_err, NoSQLError};
 use crate::handle::Handle;
+use crate::stats::{StatsHandler, StatsHandlerRef, StatsPercentileMode, StatsProfile};
 use reqwest::header::HeaderValue;
 use reqwest::Client;
 use reqwest::{header::HeaderMap, Certificate};
@@ -37,6 +38,12 @@ use crate::region::{file_to_string, string_to_region, Region};
 pub struct HandleBuilder {
     pub(crate) endpoint: String,
     pub(crate) timeout: Option<Duration>,
+    pub(crate) stats_profile: StatsProfile,
+    pub(crate) stats_interval: Option<Duration>,
+    pub(crate) stats_pretty_print: bool,
+    pub(crate) stats_enable_log: Option<bool>,
+    pub(crate) stats_percentile_mode: StatsPercentileMode,
+    pub(crate) stats_handler: StatsHandlerRef,
     pub(crate) region: Option<Region>,
     // TODO
     //pub(crate) allow_imds: bool,
@@ -214,6 +221,11 @@ impl HandleBuilder {
     /// | `ORACLE_NOSQL_COMPARTMENT_ID` | For OCI auth, the default compartment id to use (see [`HandleBuilder::compartment_id()`]).
     /// | `ORACLE_NOSQL_CA_CERT` | For `onprem` auth, the path to the certificate file in `pem` format (see [`HandleBuilder::add_cert_from_pemfile()`]). |
     /// | `ORACLE_NOSQL_ACCEPT_INVALID_CERTS` | For `onprem` auth, if this is set to `1` or `true`, do not check certificates (see [`HandleBuilder::danger_accept_invalid_certs()`]). |
+    /// | `NOSQL_STATS_PROFILE` / `ORACLE_NOSQL_STATS_PROFILE` | The stats profile. One of: `NONE`, `REGULAR`, `MORE`, `ALL` (see [`HandleBuilder::stats_profile()`]). |
+    /// | `NOSQL_STATS_INTERVAL` / `ORACLE_NOSQL_STATS_INTERVAL` | The stats interval in seconds (see [`HandleBuilder::stats_interval()`]). |
+    /// | `NOSQL_STATS_PRETTY_PRINT` / `ORACLE_NOSQL_STATS_PRETTY_PRINT` | Whether future stats log output should be pretty-printed (see [`HandleBuilder::stats_pretty_print()`]). |
+    /// | `NOSQL_STATS_ENABLE_LOG` / `ORACLE_NOSQL_STATS_ENABLE_LOG` | Whether future stats log output should be enabled (see [`HandleBuilder::stats_enable_log()`]). |
+    /// | `NOSQL_STATS_PERCENTILE_MODE` / `ORACLE_NOSQL_STATS_PERCENTILE_MODE` | Percentile calculation mode for `MORE` and `ALL`. One of: `EXACT`, `HDR` (see [`HandleBuilder::stats_percentile_mode()`]). |
     ///
     pub fn from_environment(mut self) -> Result<Self, NoSQLError> {
         self.from_environment = true;
@@ -241,6 +253,7 @@ impl HandleBuilder {
                 self = self.danger_accept_invalid_certs(true)?;
             }
         }
+        self = self.apply_stats_environment(|name| env::var(name).ok())?;
         if let Some(val) = env::var("ORACLE_NOSQL_AUTH").ok() {
             let v = val.to_lowercase();
             match v.as_str() {
@@ -274,6 +287,117 @@ impl HandleBuilder {
         }
         Ok(self)
     }
+
+    fn apply_stats_environment<F>(mut self, mut env_var: F) -> Result<Self, NoSQLError>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        if let Some((name, val)) = Self::stats_env_var_from(
+            &mut env_var,
+            "NOSQL_STATS_PROFILE",
+            "ORACLE_NOSQL_STATS_PROFILE",
+        ) {
+            let profile = Self::parse_stats_profile(&val, &name)?;
+            self = self.stats_profile(profile)?;
+        }
+        if let Some((name, val)) = Self::stats_env_var_from(
+            &mut env_var,
+            "NOSQL_STATS_INTERVAL",
+            "ORACLE_NOSQL_STATS_INTERVAL",
+        ) {
+            let interval = Self::parse_stats_interval(&val, &name)?;
+            self = self.stats_interval(interval)?;
+        }
+        if let Some((name, val)) = Self::stats_env_var_from(
+            &mut env_var,
+            "NOSQL_STATS_PRETTY_PRINT",
+            "ORACLE_NOSQL_STATS_PRETTY_PRINT",
+        ) {
+            let pretty_print = Self::parse_stats_bool(&val, &name)?;
+            self = self.stats_pretty_print(pretty_print)?;
+        }
+        if let Some((name, val)) = Self::stats_env_var_from(
+            &mut env_var,
+            "NOSQL_STATS_ENABLE_LOG",
+            "ORACLE_NOSQL_STATS_ENABLE_LOG",
+        ) {
+            let enable_log = Self::parse_stats_bool(&val, &name)?;
+            self = self.stats_enable_log(enable_log)?;
+        }
+        if let Some((name, val)) = Self::stats_env_var_from(
+            &mut env_var,
+            "NOSQL_STATS_PERCENTILE_MODE",
+            "ORACLE_NOSQL_STATS_PERCENTILE_MODE",
+        ) {
+            let percentile_mode = Self::parse_stats_percentile_mode(&val, &name)?;
+            self = self.stats_percentile_mode(percentile_mode)?;
+        }
+        Ok(self)
+    }
+
+    fn stats_env_var_from<F>(
+        env_var: &mut F,
+        python_name: &str,
+        rust_name: &str,
+    ) -> Option<(String, String)>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        if let Some(value) = env_var(rust_name) {
+            Some((rust_name.to_string(), value))
+        } else {
+            env_var(python_name).map(|value| (python_name.to_string(), value))
+        }
+    }
+
+    fn parse_stats_profile(value: &str, variable: &str) -> Result<StatsProfile, NoSQLError> {
+        match value.parse::<StatsProfile>() {
+            Ok(profile) => Ok(profile),
+            Err(_) => ia_err!(
+                "invalid value '{}' for {}. expected one of: NONE, REGULAR, MORE, ALL",
+                value,
+                variable
+            ),
+        }
+    }
+
+    fn parse_stats_interval(value: &str, variable: &str) -> Result<Duration, NoSQLError> {
+        match value.trim().parse::<u64>() {
+            Ok(seconds) if seconds > 0 => Ok(Duration::from_secs(seconds)),
+            _ => ia_err!(
+                "invalid value '{}' for {}. expected an integer number of seconds greater than zero",
+                value,
+                variable
+            ),
+        }
+    }
+
+    fn parse_stats_bool(value: &str, variable: &str) -> Result<bool, NoSQLError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "on" | "yes" => Ok(true),
+            "false" | "0" | "off" | "no" => Ok(false),
+            _ => ia_err!(
+                "invalid value '{}' for {}. expected one of: true, false, 1, 0, on, off, yes, no",
+                value,
+                variable
+            ),
+        }
+    }
+
+    fn parse_stats_percentile_mode(
+        value: &str,
+        variable: &str,
+    ) -> Result<StatsPercentileMode, NoSQLError> {
+        match value.parse::<StatsPercentileMode>() {
+            Ok(mode) => Ok(mode),
+            Err(_) => ia_err!(
+                "invalid value '{}' for {}. expected one of: EXACT, HDR",
+                value,
+                variable
+            ),
+        }
+    }
+
     /// Set a specific endpoint connection to use.
     ///
     /// This is typically used when specifying a local cloudsim instance, or an
@@ -588,6 +712,70 @@ impl HandleBuilder {
         Ok(self)
     }
 
+    /// Set the statistics collection profile.
+    ///
+    /// The default is [`StatsProfile::None`], matching the Java and Python SDKs.
+    /// Non-`None` profiles start the stats collection gate when the handle is
+    /// built. [`StatsProfile::All`] also enables query-level aggregation.
+    pub fn stats_profile(mut self, profile: StatsProfile) -> Result<Self, NoSQLError> {
+        self.stats_profile = profile;
+        Ok(self)
+    }
+
+    /// Set the statistics reporting interval.
+    ///
+    /// The Java and Python SDKs default to 600 seconds. The value is stored on
+    /// the runtime [`StatsControl`](crate::StatsControl).
+    pub fn stats_interval(mut self, interval: Duration) -> Result<Self, NoSQLError> {
+        if interval < Duration::from_secs(1) {
+            return ia_err!("stats interval must be at least 1 second");
+        }
+        self.stats_interval = Some(interval);
+        Ok(self)
+    }
+
+    /// Configure whether future statistics log output should be pretty-printed.
+    ///
+    /// The default is `false`, matching the Java and Python SDKs.
+    pub fn stats_pretty_print(mut self, pretty_print: bool) -> Result<Self, NoSQLError> {
+        self.stats_pretty_print = pretty_print;
+        Ok(self)
+    }
+
+    /// Configure whether future statistics log output should be enabled.
+    ///
+    /// Java enables stats logging by default. The value is stored for stats
+    /// runtime reporting.
+    pub fn stats_enable_log(mut self, enable_log: bool) -> Result<Self, NoSQLError> {
+        self.stats_enable_log = Some(enable_log);
+        Ok(self)
+    }
+
+    /// Set the percentile calculation mode used by [`StatsProfile::More`] and
+    /// [`StatsProfile::All`].
+    ///
+    /// [`StatsPercentileMode::Exact`] matches the Java SDK by storing samples
+    /// and sorting at interval emission time. [`StatsPercentileMode::Hdr`] uses
+    /// a bounded-memory HDR-style histogram for high-throughput clients.
+    pub fn stats_percentile_mode(
+        mut self,
+        percentile_mode: StatsPercentileMode,
+    ) -> Result<Self, NoSQLError> {
+        self.stats_percentile_mode = percentile_mode;
+        Ok(self)
+    }
+
+    /// Configure an application callback for future statistics snapshots.
+    ///
+    /// The handler is stored on the runtime stats control.
+    pub fn stats_handler<H>(mut self, handler: H) -> Result<Self, NoSQLError>
+    where
+        H: StatsHandler,
+    {
+        self.stats_handler = StatsHandlerRef::new(handler);
+        Ok(self)
+    }
+
     // for doc testing use only
     #[doc(hidden)]
     pub fn in_test(mut self, in_test: bool) -> Self {
@@ -639,6 +827,85 @@ impl HandleBuilder {
             }
             _ => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_environment_parses_settings() {
+        let builder = builder_from_stats_env(&[
+            ("NOSQL_STATS_PROFILE", "more"),
+            ("NOSQL_STATS_INTERVAL", "42"),
+            ("NOSQL_STATS_PRETTY_PRINT", "yes"),
+            ("NOSQL_STATS_ENABLE_LOG", "off"),
+            ("NOSQL_STATS_PERCENTILE_MODE", "hdr"),
+        ])
+        .unwrap();
+
+        assert_eq!(builder.stats_profile, StatsProfile::More);
+        assert_eq!(builder.stats_interval, Some(Duration::from_secs(42)));
+        assert!(builder.stats_pretty_print);
+        assert_eq!(builder.stats_enable_log, Some(false));
+        assert_eq!(builder.stats_percentile_mode, StatsPercentileMode::Hdr);
+    }
+
+    #[test]
+    fn oracle_stats_env_vars_take_precedence_over_nosql_aliases() {
+        let builder = builder_from_stats_env(&[
+            ("NOSQL_STATS_PROFILE", "REGULAR"),
+            ("ORACLE_NOSQL_STATS_PROFILE", "ALL"),
+            ("NOSQL_STATS_INTERVAL", "30"),
+            ("ORACLE_NOSQL_STATS_INTERVAL", "60"),
+            ("NOSQL_STATS_PRETTY_PRINT", "false"),
+            ("ORACLE_NOSQL_STATS_PRETTY_PRINT", "true"),
+            ("NOSQL_STATS_ENABLE_LOG", "true"),
+            ("ORACLE_NOSQL_STATS_ENABLE_LOG", "false"),
+            ("NOSQL_STATS_PERCENTILE_MODE", "EXACT"),
+            ("ORACLE_NOSQL_STATS_PERCENTILE_MODE", "HDR"),
+        ])
+        .unwrap();
+
+        assert_eq!(builder.stats_profile, StatsProfile::All);
+        assert_eq!(builder.stats_interval, Some(Duration::from_secs(60)));
+        assert!(builder.stats_pretty_print);
+        assert_eq!(builder.stats_enable_log, Some(false));
+        assert_eq!(builder.stats_percentile_mode, StatsPercentileMode::Hdr);
+    }
+
+    #[test]
+    fn stats_bool_env_parsing_accepts_supported_forms() {
+        assert!(HandleBuilder::parse_stats_bool("true", "TEST").unwrap());
+        assert!(HandleBuilder::parse_stats_bool("1", "TEST").unwrap());
+        assert!(HandleBuilder::parse_stats_bool("on", "TEST").unwrap());
+        assert!(HandleBuilder::parse_stats_bool("yes", "TEST").unwrap());
+        assert!(!HandleBuilder::parse_stats_bool("false", "TEST").unwrap());
+        assert!(!HandleBuilder::parse_stats_bool("0", "TEST").unwrap());
+        assert!(!HandleBuilder::parse_stats_bool("off", "TEST").unwrap());
+        assert!(!HandleBuilder::parse_stats_bool("no", "TEST").unwrap());
+    }
+
+    #[test]
+    fn stats_env_parsing_rejects_invalid_values() {
+        let error = builder_from_stats_env(&[("NOSQL_STATS_PROFILE", "LOUD")]).unwrap_err();
+
+        assert!(error.message.contains("NOSQL_STATS_PROFILE"));
+        assert!(error.message.contains("NONE, REGULAR, MORE, ALL"));
+
+        assert!(HandleBuilder::parse_stats_interval("0", "INTERVAL").is_err());
+        assert!(HandleBuilder::parse_stats_interval("abc", "INTERVAL").is_err());
+        assert!(HandleBuilder::parse_stats_bool("maybe", "BOOL").is_err());
+        assert!(HandleBuilder::parse_stats_percentile_mode("sketch", "MODE").is_err());
+    }
+
+    fn builder_from_stats_env(vars: &[(&str, &str)]) -> Result<HandleBuilder, NoSQLError> {
+        HandleBuilder::new().apply_stats_environment(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        })
     }
 }
 

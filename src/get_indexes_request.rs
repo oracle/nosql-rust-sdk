@@ -91,6 +91,7 @@ impl GetIndexesRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: true,
+            request_name: "GetIndexes",
             compartment_id: self.compartment_id.clone(),
             namespace: self.namespace.clone(),
             ..Default::default()
@@ -108,8 +109,8 @@ impl GetIndexesRequest {
 
         // payload
         ns.start_payload();
-        ns.write_string_field(INDEX, &self.index_name);
         ns.write_nonempty_string_field(NAMESPACE, &self.namespace);
+        ns.write_nonempty_string_field(INDEX, &self.index_name);
         // TODO: these are currently only in http headers. Add to NSON?
         //ns.write_string_field(COMPARTMENT_OCID, &self.compartment_id);
         ns.end_payload();
@@ -185,29 +186,39 @@ impl GetIndexesRequest {
 
     fn read_index_fields(r: &mut Reader, res: &mut IndexInfo) -> Result<(), NoSQLError> {
         let mut walker = MapWalker::new(r)?;
+        let mut field_name: Option<String> = None;
+        let mut field_type: Option<String> = None;
         while walker.has_next() {
             walker.next()?;
-            // ensure we get both fields
-            let mut num_fields = 0;
             let name = walker.current_name();
             match name.as_str() {
                 PATH => {
-                    res.field_names.push(walker.read_nson_string()?);
-                    num_fields += 1;
+                    field_name = Some(walker.read_nson_string()?);
                 }
                 TYPE => {
-                    res.field_types.push(walker.read_nson_string()?);
-                    num_fields += 1;
+                    field_type = Some(walker.read_nson_string()?);
                 }
                 _ => {
                     //println!("   read_index_fields: skipping field '{}'", name);
                     walker.skip_nson_field()?;
                 }
             }
-            if num_fields != 2 {
+        }
+        match (field_name, field_type) {
+            (Some(field_name), Some(field_type)) => {
+                res.field_names.push(field_name);
+                res.field_types.push(field_type);
+            }
+            (None, _) => {
                 return Err(NoSQLError::new(
                     BadProtocolMessage,
-                    "response missing PATH or TYPE element(s)",
+                    "response missing PATH element",
+                ));
+            }
+            (_, None) => {
+                return Err(NoSQLError::new(
+                    BadProtocolMessage,
+                    "response missing TYPE element",
                 ));
             }
         }
@@ -218,5 +229,73 @@ impl GetIndexesRequest {
 impl NsonRequest for GetIndexesRequest {
     fn serialize(&self, w: &mut Writer, timeout: &Duration) {
         self.nson_serialize(w, timeout);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn serialized_payload_fields(request: &GetIndexesRequest) -> Vec<String> {
+        let mut writer = Writer::new();
+        request.nson_serialize(&mut writer, &Duration::from_secs(30));
+        let mut reader = Reader::new().from_bytes(writer.bytes());
+        let mut root = MapWalker::new(&mut reader).unwrap();
+
+        while root.has_next() {
+            root.next().unwrap();
+            let name = root.current_name().clone();
+            if name != PAYLOAD {
+                root.skip_nson_field().unwrap();
+                continue;
+            }
+
+            let mut payload = MapWalker::new(root.r).unwrap();
+            let mut fields = Vec::new();
+            while payload.has_next() {
+                payload.next().unwrap();
+                fields.push(payload.current_name().clone());
+                payload.skip_nson_field().unwrap();
+            }
+            return fields;
+        }
+
+        panic!("serialized get-indexes request did not contain payload");
+    }
+
+    fn contains_field(fields: &[String], field: &str) -> bool {
+        fields.iter().any(|name| name == field)
+    }
+
+    #[test]
+    fn serialize_omits_empty_index_name() {
+        let fields = serialized_payload_fields(&GetIndexesRequest::new("users").index_name(""));
+
+        assert!(!contains_field(&fields, INDEX));
+
+        let fields =
+            serialized_payload_fields(&GetIndexesRequest::new("users").index_name("idx_users"));
+
+        assert!(contains_field(&fields, INDEX));
+    }
+
+    #[test]
+    fn read_index_fields_rejects_missing_type() {
+        let mut writer = Writer::new();
+        {
+            let mut ns = NsonSerializer::new(&mut writer);
+            ns.start_map("");
+            ns.write_string_field(PATH, "profileName");
+            ns.end_map("");
+        }
+        let mut reader = Reader::new().from_bytes(writer.bytes());
+        let mut index = IndexInfo::default();
+
+        let error = GetIndexesRequest::read_index_fields(&mut reader, &mut index).unwrap_err();
+
+        assert_eq!(error.code, BadProtocolMessage);
+        assert!(error.message.contains("TYPE"));
+        assert!(index.field_names.is_empty());
+        assert!(index.field_types.is_empty());
     }
 }
