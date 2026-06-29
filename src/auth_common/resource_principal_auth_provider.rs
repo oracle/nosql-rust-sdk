@@ -10,6 +10,8 @@ use openssl::rsa::Rsa;
 use serde_json::Value;
 use std::env;
 use std::error::Error;
+use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::trace;
 
 use crate::auth_common::authentication_provider::AuthenticationProvider;
@@ -37,13 +39,27 @@ static RP_REGION_ENV: &str = "OCI_RESOURCE_PRINCIPAL_REGION";
 // the key used to look up the resource tenancy in an RPST
 static TENANCY_CLAIM_KEY: &str = "res_tenant";
 
-#[derive(Debug, Clone)]
+// Refresh resource principal material shortly before RPST expiry.
+static RP_REFRESH_WINDOW_SECS: u64 = 300;
+
+#[derive(Clone)]
 pub struct ResourcePrincipalAuthProvider {
     token: String,
     session_private_key: Rsa<Private>,
     tenancy_id: String,
     region: String,
-    //expiration: u64, // seconds since the epoch
+    expiration_secs: u64,
+}
+
+impl fmt::Debug for ResourcePrincipalAuthProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResourcePrincipalAuthProvider")
+            .field("token", &"[redacted]")
+            .field("session_private_key", &"[redacted]")
+            .field("tenancy_id", &self.tenancy_id)
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 impl AuthenticationProvider for ResourcePrincipalAuthProvider {
@@ -65,6 +81,9 @@ impl AuthenticationProvider for ResourcePrincipalAuthProvider {
     }
     fn key_id(&self) -> String {
         self.token.clone()
+    }
+    fn should_refresh(&self) -> bool {
+        self.expires_within_secs(RP_REFRESH_WINDOW_SECS)
     }
 }
 
@@ -179,47 +198,127 @@ impl ResourcePrincipalAuthProvider {
         // the payload should not be padded
         let decoded = Base64Unpadded::decode_vec(&payload)?;
         let v: Value = serde_json::from_slice(&decoded)?;
-        // TODO: better method for checking these values (not checking for "null")
-        let tenancy = format!("{}", v[TENANCY_CLAIM_KEY]).replace("\"", "");
-        if tenancy == "null" {
-            return Err(
-                format!("RPST token missing '{}' in payload", TENANCY_CLAIM_KEY)
-                    .as_str()
-                    .into(),
-            );
+        let tenancy = token_string_claim(&v, TENANCY_CLAIM_KEY)?;
+        let expiration_secs = token_expiration_claim(&v)?;
+        if expiration_secs <= now_in_secs() {
+            return Err("RPST token is expired".into());
         }
-        let exp = format!("{}", v["exp"]).replace("\"", "");
-        if exp == "null" {
-            return Err(format!("RPST token missing 'exp' in payload")
-                .as_str()
-                .into());
-        }
-        trace!("rpst expiration={}", exp);
-        let token_last_4: String = token
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        trace!(
-            "using RPST token: len={}, last4={}",
-            token.chars().count(),
-            token_last_4
-        );
+        trace!("rpst expiration={}", expiration_secs);
+        trace!("using RPST token: len={}", token.chars().count());
 
         Ok(ResourcePrincipalAuthProvider {
             token: format!("ST${}", token),
             session_private_key: session_private_key,
             tenancy_id: tenancy,
             region: region,
+            expiration_secs,
         })
     }
+
+    fn expires_within_secs(&self, window_secs: u64) -> bool {
+        now_in_secs() >= self.expiration_secs.saturating_sub(window_secs)
+    }
+}
+
+fn token_string_claim(v: &Value, claim: &str) -> Result<String, Box<dyn Error>> {
+    let claim_value = v
+        .get(claim)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("RPST token missing '{}' in payload", claim))?;
+    if claim_value.is_empty() {
+        return Err(format!("RPST token has empty '{}' in payload", claim).into());
+    }
+    Ok(claim_value.to_string())
+}
+
+fn token_expiration_claim(v: &Value) -> Result<u64, Box<dyn Error>> {
+    let exp = v
+        .get("exp")
+        .ok_or_else(|| "RPST token missing 'exp' in payload".to_string())?;
+    match exp {
+        Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| "RPST token 'exp' must be a non-negative integer".into()),
+        Value::String(s) => s
+            .parse::<u64>()
+            .map_err(|_| "RPST token 'exp' must be a non-negative integer".into()),
+        _ => Err("RPST token 'exp' must be a non-negative integer".into()),
+    }
+}
+
+fn now_in_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Reversed UNIX time??")
+        .as_secs()
 }
 
 // By contract for the the content of a resource principal to be considered path, it needs to be
 // an absolute path.
 fn is_path(val: &str) -> bool {
     std::path::Path::new(val).is_absolute()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64ct::{Base64Unpadded, Encoding};
+
+    #[test]
+    fn debug_redacts_token_and_private_key() {
+        let provider = ResourcePrincipalAuthProvider {
+            token: "ST$secret-rpst-token".to_string(),
+            session_private_key: Rsa::generate(2048).unwrap(),
+            tenancy_id: "tenancy".to_string(),
+            region: "region".to_string(),
+            expiration_secs: now_in_secs() + 3600,
+        };
+
+        let debug = format!("{:?}", provider);
+
+        assert!(!debug.contains("secret-rpst-token"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn new_from_values_stores_expiration_and_uses_refresh_window() {
+        let expiration_secs = now_in_secs() + 3600;
+        let provider = ResourcePrincipalAuthProvider::new_from_values(
+            test_rpst_token("ocid1.tenancy.oc1..abc", expiration_secs),
+            test_private_key_pem(),
+            None,
+            "us-ashburn-1".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(provider.expiration_secs, expiration_secs);
+        assert!(!provider.should_refresh());
+        assert!(provider.expires_within_secs(4000));
+    }
+
+    #[test]
+    fn new_from_values_rejects_expired_rpst() {
+        let err = ResourcePrincipalAuthProvider::new_from_values(
+            test_rpst_token("ocid1.tenancy.oc1..abc", now_in_secs() - 1),
+            test_private_key_pem(),
+            None,
+            "us-ashburn-1".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("expired"));
+    }
+
+    fn test_rpst_token(tenancy_id: &str, expiration_secs: u64) -> String {
+        let header = Base64Unpadded::encode_string(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = Base64Unpadded::encode_string(
+            format!(r#"{{"res_tenant":"{tenancy_id}","exp":{expiration_secs}}}"#).as_bytes(),
+        );
+        format!("{header}.{payload}.signature")
+    }
+
+    fn test_private_key_pem() -> String {
+        let rsa = Rsa::generate(2048).unwrap();
+        String::from_utf8(rsa.private_key_to_pem().unwrap()).unwrap()
+    }
 }

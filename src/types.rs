@@ -5,13 +5,13 @@
 //  https://oss.oracle.com/licenses/upl/
 //
 use base64::prelude::{Engine as _, BASE64_STANDARD};
-use bigdecimal::BigDecimal;
-use bigdecimal::Num;
+use bigdecimal::{BigDecimal, Context, Num, RoundingMode};
 use chrono::{DateTime, FixedOffset};
 use std::cmp::Ordering;
 use std::collections::btree_map::Iter;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::result::Result;
 use std::string::String;
 use std::vec::Vec;
@@ -402,6 +402,18 @@ pub(crate) fn bd_try_from_str(val: &str) -> Result<BigDecimal, NoSQLError> {
             );
         }
     }
+}
+
+pub(crate) fn bd_round_decimal32(val: BigDecimal) -> BigDecimal {
+    decimal32_context().round_decimal(val)
+}
+
+pub(crate) fn bd_add_decimal32(lhs: &BigDecimal, rhs: &BigDecimal) -> BigDecimal {
+    decimal32_context().add_refs(lhs, rhs)
+}
+
+fn decimal32_context() -> Context {
+    Context::new(NonZeroU64::new(7).unwrap(), RoundingMode::HalfEven)
 }
 
 pub trait NoSQLColumnToFieldValue {
@@ -1014,83 +1026,86 @@ pub(crate) enum OpCode {
 
     // DeleteIfVersion is used for the operation that deletes a row from table
     // if the row matches the specified version.
-    DeleteIfVersion, // 1
+    DeleteIfVersion = 1,
 
     // Get is used for the operation that retrieves a row from table.
-    Get, // 2
+    Get = 2,
 
     // Put is used for the operation that unconditionally puts a row to table.
-    Put, // 3
+    Put = 3,
 
     // PutIfAbsent is used for the operation that puts a row to table if the row
     // is absent.
-    PutIfAbsent, // 4
+    PutIfAbsent = 4,
 
     // PutIfPresent is used for the operation that puts a row to table if the row
     // is present.
-    PutIfPresent, // 5
+    PutIfPresent = 5,
 
     // PutIfVersion is used for the operation that puts a row to table if the row
     // matches the specified version.
-    PutIfVersion, // 6
+    PutIfVersion = 6,
 
     // Query is used for the query operation.
     // A query operation can perform select, insert, update and delete operations
     // over an SQL statement.
-    Query, // 7
+    Query = 7,
 
     // Prepare is used for the operation that compiles/prepares an SQL statement
     // before execution.
-    Prepare, // 8
+    Prepare = 8,
 
     // WriteMultiple is used to perform multiple write operations associated
     // with a table in a single transaction.
-    WriteMultiple, // 9
+    WriteMultiple = 9,
 
     // MultiDelete is used for the operation that deletes multiple rows from a
     // table in a single transaction.
-    MultiDelete, // 10
+    MultiDelete = 10,
 
     // GetTable is used for the operation that retrieves static information about a table.
-    GetTable, // 11
+    GetTable = 11,
 
     // GetIndexes is used for the operation that retrieves information about an index.
-    GetIndexes, // 12
+    GetIndexes = 12,
 
     // GetTableUsage is used for the operation that retrieves usage information on a table.
-    GetTableUsage, // 13
+    GetTableUsage = 13,
 
     // ListTables is used for the operation that lists all available table names.
-    ListTables, // 14
+    ListTables = 14,
 
     // TableRequest is used for the operation that manages table schema or
     // changes table limits.
-    TableRequest, // 15
+    TableRequest = 15,
 
     // Scan is reserved for internal use.
-    Scan, // 16
+    Scan = 16,
 
     // IndexScan is reserved for internal use.
-    IndexScan, // 17
+    IndexScan = 17,
 
     // CreateTable represents the operation that creates a table.
-    CreateTable, // 18
+    CreateTable = 18,
 
     // AlterTable represents the operation that modifies the table schema.
-    AlterTable, // 19
+    AlterTable = 19,
 
     // DropTable represents the operation that drops a table.
-    DropTable, // 20
+    DropTable = 20,
 
     // CreateIndex represents the operation that creates an index on a table.
-    CreateIndex, // 21
+    CreateIndex = 21,
+
+    // DropIndex represents the operation that drops an index on a table.
+    DropIndex = 22,
 
     // SystemRequest is used to perform system operations such as
     // administrative operations that do not affect a specific table.
-    SystemRequest, // 23
+    SystemRequest = 23,
 
     // SystemStatusRequest is used to retrieve the operation status of a SystemRequest.
-    SystemStatusRequest, // 24
+    SystemStatusRequest = 24,
 }
 
 // Capacity represents the read/write throughput consumed by an operation.
@@ -1115,6 +1130,14 @@ impl Capacity {
         self.read_kb += c.read_kb;
         self.read_units += c.read_units;
         self.write_kb += c.write_kb;
+    }
+
+    pub(crate) fn delta_since(&self, previous: &Capacity) -> Capacity {
+        Capacity {
+            read_kb: self.read_kb - previous.read_kb,
+            read_units: self.read_units - previous.read_units,
+            write_kb: self.write_kb - previous.write_kb,
+        }
     }
 }
 
@@ -1317,6 +1340,17 @@ pub(crate) fn compare_atomics_total_order(
                 return Ordering::Equal;
             }
         }
+
+        // QTF expected results are JSON, so NUMBER values may be parsed as
+        // DOUBLE on one side of the comparison. Match Java's default
+        // MathContext.DECIMAL32 for these cross-type expected/actual checks.
+        if (tc0 == FieldType::Number && tc1 == FieldType::Double)
+            || (tc0 == FieldType::Double && tc1 == FieldType::Number)
+        {
+            let bd0 = bd_round_decimal32(v0.as_big_decimal().unwrap());
+            let bd1 = bd_round_decimal32(v1.as_big_decimal().unwrap());
+            return bd0.cmp(&bd1);
+        }
     }
 
     match tc0 {
@@ -1419,6 +1453,9 @@ pub(crate) fn compare_atomics_total_order(
                 }
                 FieldType::Double => {
                     let fv1 = f64::from_field(v1).unwrap();
+                    if nulls_equal && qtf_float_roundtrip_equal(fv0, fv1) {
+                        return Ordering::Equal;
+                    }
                     return compare_floats(&fv0, &fv1);
                 }
                 FieldType::Number => {
@@ -1756,12 +1793,58 @@ fn compare_arrays(v1: &FieldValue, v2: &FieldValue, ss: &SortSpec, nulls_equal: 
     if av1.len() == av2.len() {
         return Ordering::Equal;
     }
-    if av2.len() > av1.len() {
-        return modify_order(Ordering::Greater, ss);
+    if av1.len() < av2.len() {
+        return modify_order(Ordering::Less, ss);
     }
-    modify_order(Ordering::Less, ss)
+    modify_order(Ordering::Greater, ss)
 }
 
 fn compare_floats(v0: &f64, v1: &f64) -> Ordering {
+    if v0.is_nan() && v1.is_nan() {
+        return Ordering::Equal;
+    }
     v0.total_cmp(v1)
+}
+
+fn qtf_float_roundtrip_equal(v0: f64, v1: f64) -> bool {
+    if !v0.is_finite() || !v1.is_finite() {
+        return false;
+    }
+
+    let v0_as_float = v0 as f32 as f64;
+    let v1_as_float = v1 as f32 as f64;
+    compare_floats(&v0_as_float, &v1) == Ordering::Equal
+        || compare_floats(&v1_as_float, &v0) == Ordering::Equal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compare_field_values, compare_map_values_sortspec, FieldValue, MapValue};
+    use crate::sort_iter::SortSpec;
+    use core::cmp::Ordering;
+
+    #[test]
+    fn nan_payloads_compare_equal() {
+        let nan_a = FieldValue::Double(f64::from_bits(0x7ff8_0000_0000_0001));
+        let nan_b = FieldValue::Double(f64::from_bits(0x7ff8_0000_0000_0002));
+        assert_eq!(compare_field_values(&nan_a, &nan_b, false), Ordering::Equal);
+    }
+
+    #[test]
+    fn qtf_comparison_matches_float_roundtrip_values() {
+        let mut expected = MapValue::new();
+        expected.put_float64("fv", 3.14);
+
+        let mut actual = MapValue::new();
+        actual.put_float64("fv", 3.14_f32 as f64);
+
+        assert_ne!(
+            compare_map_values_sortspec(&expected, &actual, &SortSpec::default(), false),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_map_values_sortspec(&expected, &actual, &SortSpec::default(), true),
+            Ordering::Equal
+        );
+    }
 }

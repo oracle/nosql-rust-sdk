@@ -199,11 +199,19 @@ impl MultiDeleteRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: false,
+            request_name: "MultiDelete",
             compartment_id: self.compartment_id.clone(),
+            table_name: self.table_name.clone(),
+            does_reads: true,
+            does_writes: true,
             ..Default::default()
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
         let resp = MultiDeleteRequest::nson_deserialize(&mut r)?;
+        if let Some(consumed) = resp.consumed.as_ref() {
+            h.consume_rate_limited_capacity(&mut opts, &self.table_name, consumed)
+                .await;
+        }
         Ok(resp)
     }
 
@@ -228,12 +236,16 @@ impl MultiDeleteRequest {
             ns.start_map(RANGE);
             ns.write_string_field(RANGE_PATH, &range.field_path);
             if let Some(start) = &range.start {
+                ns.start_map(START);
                 ns.write_field(VALUE, start);
                 ns.write_bool_field(INCLUSIVE, range.start_inclusive);
+                ns.end_map(START);
             }
             if let Some(end) = &range.end {
+                ns.start_map(END);
                 ns.write_field(VALUE, end);
                 ns.write_bool_field(INCLUSIVE, range.end_inclusive);
+                ns.end_map(END);
             }
             ns.end_map(RANGE);
         }

@@ -86,6 +86,10 @@ pub struct PreparedStatement {
     // every time a new batch of results is needed.
     pub(crate) statement: Vec<u8>,
 
+    // Query protocol v6 returns prepared query blobs by branch. Non-UNION
+    // queries have a single branch; UNION queries have one per branch.
+    pub(crate) branches: Vec<PreparedStatementBranch>,
+
     // variable_to_ids maps the name of each external variable to its id, which is
     // a position in a FieldValue array stored in the QueryRequest and
     // holding the values of the variables.
@@ -98,6 +102,13 @@ pub struct PreparedStatement {
     pub(crate) num_iterators: i32,
 
     pub(crate) data: PreparedStatementData,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PreparedStatementBranch {
+    pub(crate) statement: Vec<u8>,
+    pub(crate) table_name: Option<String>,
+    pub(crate) namespace: Option<String>,
 }
 
 impl std::fmt::Debug for PreparedStatement {
@@ -138,11 +149,37 @@ impl Clone for PreparedStatementData {
 }
 
 impl PreparedStatement {
+    const OPCODE_SELECT: u8 = 5;
+
+    pub(crate) fn sql_text(&self) -> &str {
+        &self.sql_text
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn query_plan(&self) -> &str {
+        &self.query_plan
+    }
+
+    pub(crate) fn is_simple_query(&self) -> bool {
+        self.is_simple()
+    }
+
+    pub(crate) fn print_driver_plan(&self) -> Option<String> {
+        if self.is_simple() {
+            None
+        } else {
+            Some(format!("{:?}", self.driver_query_plan))
+        }
+    }
+
     pub(crate) fn is_simple(&self) -> bool {
         self.driver_query_plan.get_kind() == PlanIterKind::Empty
     }
     pub(crate) fn is_empty(&self) -> bool {
         self.statement.len() == 0
+    }
+    pub(crate) fn does_writes(&self) -> bool {
+        !self.is_empty() && self.operation != Self::OPCODE_SELECT
     }
     // set iterators/etc to their initial values, as if
     // they had just been deserialized
@@ -152,18 +189,45 @@ impl PreparedStatement {
         //self.data = PreparedStatementData::default();
         Ok(())
     }
-    pub(crate) fn copy_for_internal(&self) -> Self {
+    pub(crate) fn copy_for_internal(&self, branch_index: Option<usize>) -> Self {
         let mut data = PreparedStatementData::default();
         for (k, v) in &self.data.bind_variables {
             data.bind_variables.insert(k.clone(), v.clone_internal());
         }
+
+        let (statement, table_name, namespace) = if let Some(index) = branch_index {
+            let branch = self
+                .branches
+                .get(index)
+                .unwrap_or_else(|| panic!("missing prepared query branch {}", index));
+            (
+                branch.statement.clone(),
+                branch.table_name.clone(),
+                branch.namespace.clone(),
+            )
+        } else {
+            (
+                self.statement.clone(),
+                self.table_name.clone(),
+                self.namespace.clone(),
+            )
+        };
+
         PreparedStatement {
-            // we only keep the actual binary prepared statement, all other
-            // fields get their defaults
-            statement: self.statement.clone(),
+            sql_text: self.sql_text.clone(),
+            query_plan: self.query_plan.clone(),
+            query_schema: self.query_schema.clone(),
+            statement,
+            table_name,
+            namespace,
+            operation: self.operation,
             data: data,
             ..Default::default()
         }
+    }
+
+    pub(crate) fn set_sql_text(&mut self, sql_text: &str) {
+        self.sql_text = sql_text.to_string();
     }
 
     pub(crate) fn set_variable(

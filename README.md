@@ -38,8 +38,110 @@ async fn main() -> Result<(), Box<dyn Error>> {
 ```
 
 
+### Statistics
+
+The SDK can collect client-side request statistics using Java-compatible profile
+names, profile behavior, and JSON field names. The periodic stats payload is
+intended to match the Oracle NoSQL Java SDK contract rather than define a
+Rust-specific format.
+
+Profiles:
+
+- `StatsProfile::None` disables collection and does not emit stats. This is the
+  default.
+- `StatsProfile::Regular` emits aggregate request counts, success/error counts,
+  retry counts, request and response sizes, and basic latency summaries.
+- `StatsProfile::More` adds `95th` and `99th` latency percentile fields to the
+  aggregate request statistics.
+- `StatsProfile::All` adds query-level aggregation for SQL query executions.
+
+Configure statistics on the `HandleBuilder` before building the handle. A
+non-`None` profile starts collection when the handle is built. Percentiles use
+exact Java-style samples by default; `StatsPercentileMode::Hdr` switches to a
+bounded histogram mode for lower memory growth under high request volume:
+
+```rust
+use oracle_nosql_rust_sdk::{Handle, StatsPercentileMode, StatsProfile, StatsSnapshot};
+use std::error::Error;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let handle = Handle::builder()
+        .from_environment()?
+        .stats_profile(StatsProfile::All)?
+        .stats_interval(Duration::from_secs(600))?
+        .stats_pretty_print(true)?
+        .stats_percentile_mode(StatsPercentileMode::Exact)?
+        .stats_handler(|stats: &StatsSnapshot| {
+            println!("{}", stats.as_json());
+        })?
+        .build()
+        .await?;
+
+    let stats = handle.get_stats_control();
+    assert!(stats.is_started());
+    stats.stop();
+    stats.set_profile(StatsProfile::Regular);
+    stats.start();
+    Ok(())
+}
+```
+
+Stats latency is measured at the SDK HTTP boundary: the timer starts
+immediately before the HTTP request is sent and stops after the response body
+bytes are received. It includes network/proxy/server wait time and response body
+read time. It does not include full NSON result deserialization, final result
+object creation, or user code after `execute()` returns.
+
+`StatsProfile::All` can include raw SQL text and query plan text in emitted
+stats. For workloads where SQL literals, table names, or plans may be sensitive,
+prefer `stats_enable_log(false)?` and a `stats_handler` that redacts before
+storing or forwarding snapshots.
+
+The same settings can be supplied through environment variables:
+
+- `NOSQL_STATS_PROFILE` or `ORACLE_NOSQL_STATS_PROFILE`
+- `NOSQL_STATS_INTERVAL` or `ORACLE_NOSQL_STATS_INTERVAL`
+- `NOSQL_STATS_PRETTY_PRINT` or `ORACLE_NOSQL_STATS_PRETTY_PRINT`
+- `NOSQL_STATS_ENABLE_LOG` or `ORACLE_NOSQL_STATS_ENABLE_LOG`
+- `NOSQL_STATS_PERCENTILE_MODE` or `ORACLE_NOSQL_STATS_PERCENTILE_MODE`
+  (`EXACT` or `HDR`)
+
+When stats logging is enabled, interval snapshots are emitted at `INFO` with
+the `Client stats|` prefix. The periodic payload follows the Java SDK schema:
+`clientId`, `startTime`, `endTime`, `requests`, optional `queries`, and optional
+`connections`. Initialization metadata such as SDK name and profile is logged
+separately. Like the Java SDK, `stop()` stops collection but a non-`None` profile
+can still emit empty interval snapshots.
+
+For terminal examples and validation workloads, run:
+
+```sh
+cargo run --example stats
+STATS_PERCENTILE_MODE=HDR cargo run --example stats
+cargo run --example stats_profile_output_demo -- localhost 8080 MORE HDR
+cargo run --example stats_periodic_workload -- localhost 8080 300 5 MORE 1 HDR
+```
+
+With CloudSim running on `localhost:8080`, the ignored opt-in end-to-end stats
+test runs a mixed real SDK workload, independently computes throughput plus
+average, p95, and p99 latency, then checks those values against the SDK stats
+snapshot with configured tolerances:
+
+```sh
+RUN_NOSQL_STATS_E2E=1 \
+NOSQL_STATS_E2E_MODE=cloudsim \
+NOSQL_STATS_E2E_ENDPOINT=http://localhost:8080 \
+cargo test --test stats_e2e_tests -- --ignored --nocapture
+```
+
+For maintainer notes and validation commands, see
+[`docs/stats.md`](docs/stats.md).
+
+
 ### Prerequisites
-- Rust 1.78 or later
+- Rust 1.88 or later
   - Download and install a [Rust](https://www.rust-lang.org/tools/install) binary release suitable for your system. See the install and setup instructions on that page.
 - Oracle NoSQL Database. Use one of the options:
   - Subscribe to the [Oracle NoSQL Database Cloud Service](https://www.oracle.com/database/nosql-cloud.html).

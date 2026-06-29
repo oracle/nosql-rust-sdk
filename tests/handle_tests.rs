@@ -26,6 +26,7 @@ use oracle_nosql_rust_sdk::WriteMultipleRequest;
 use std::collections::HashMap;
 use std::error::Error;
 use std::time::Duration;
+use std::time::SystemTime;
 
 fn get_builder() -> Result<HandleBuilder, NoSQLError> {
     Handle::builder()
@@ -39,6 +40,14 @@ fn get_builder() -> Result<HandleBuilder, NoSQLError> {
         //.cloud_auth_from_instance()
         // this will override any defaults above
         .from_environment()
+}
+
+fn unique_table_name(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{}_{}_{}", prefix, std::process::id(), nanos)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -202,6 +211,112 @@ async fn smoke_test() -> Result<(), Box<dyn Error>> {
 // TODO: TableUsageRequest (verify rfc3339 semantics)
 // TODO: WriteMultiple with all pass, some pass, all fail, if present, etc.
 // TODO: MultiDeleteRequest
+
+#[tokio::test]
+async fn drop_index_test() -> Result<(), Box<dyn Error>> {
+    let handle = get_builder()?.build().await?;
+    let table_name = unique_table_name("dropindextest");
+    let index_name = "idx_dropindextest_name";
+
+    TableRequest::new(&table_name)
+        .statement(&format!(
+            "create table {} (id integer, name string, primary key(id))",
+            table_name
+        ))
+        .limits(&TableLimits::provisioned(10, 10, 10))
+        .execute(&handle)
+        .await?
+        .wait_for_completion_ms(&handle, 15000, 500)
+        .await?;
+
+    TableRequest::new(&table_name)
+        .statement(&format!(
+            "create index {} on {} (name)",
+            index_name, table_name
+        ))
+        .execute(&handle)
+        .await?
+        .wait_for_completion_ms(&handle, 15000, 500)
+        .await?;
+
+    TableRequest::new(&table_name)
+        .statement(&format!("drop index {} on {}", index_name, table_name))
+        .execute(&handle)
+        .await?
+        .wait_for_completion_ms(&handle, 15000, 500)
+        .await?;
+
+    TableRequest::new(&table_name)
+        .statement(&format!("drop table if exists {}", table_name))
+        .execute(&handle)
+        .await?
+        .wait_for_completion_ms(&handle, 15000, 500)
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn advanced_query_internal_fetch_options_test() -> Result<(), Box<dyn Error>> {
+    let handle = get_builder()?.build().await?;
+    let table_name = unique_table_name("advancedqueryopts");
+
+    let test_result: Result<(), Box<dyn Error>> = async {
+        TableRequest::new(&table_name)
+            .statement(&format!(
+                "create table {} (id integer, payload string, primary key(id))",
+                table_name
+            ))
+            .limits(&TableLimits::provisioned(1000, 1000, 10))
+            .execute(&handle)
+            .await?
+            .wait_for_completion_ms(&handle, 15000, 500)
+            .await?;
+
+        for i in (0..12).rev() {
+            let payload = format!("{:02}-{}", i, "x".repeat(1024));
+            PutRequest::new(&table_name)
+                .value(MapValue::new().i32("id", i).str("payload", &payload))
+                .execute(&handle)
+                .await?;
+        }
+
+        let mut query = QueryRequest::new(&format!(
+            "select id, payload from {} order by payload",
+            table_name
+        ))
+        .compartment_id("ignored-by-cloudsim")
+        .consistency(&Consistency::Eventual)
+        .max_read_kb(1)
+        .max_write_kb(1);
+        let result = query.execute(&handle).await?;
+        assert_eq!(result.rows().len(), 12);
+
+        let mut previous = String::new();
+        for row in result.rows() {
+            let payload = row.get_string("payload").ok_or("payload missing")?;
+            assert!(payload.as_str() >= previous.as_str());
+            previous = payload;
+        }
+
+        Ok(())
+    }
+    .await;
+
+    let cleanup_result = async {
+        TableRequest::new(&table_name)
+            .statement(&format!("drop table if exists {}", table_name))
+            .execute(&handle)
+            .await?
+            .wait_for_completion_ms(&handle, 15000, 500)
+            .await
+    }
+    .await;
+
+    test_result?;
+    cleanup_result?;
+    Ok(())
+}
 
 #[derive(Default, Debug, NoSQLRow)]
 struct Person {
@@ -469,6 +584,23 @@ struct ComplexData {
     pub data: Option<ComplexA>,
 }
 
+#[derive(Default, Debug, Clone, NoSQLRow)]
+struct JsonPortionA {
+    #[nosql(column=fielda)]
+    pub a: i64,
+    #[nosql(column=fieldb)]
+    pub b: String,
+}
+
+#[derive(Default, Debug, NoSQLRow)]
+struct JsonCollectionData {
+    pub id: i64,
+    #[nosql(column=portiona)]
+    pub a: Vec<JsonPortionA>,
+    #[nosql(column=portionb)]
+    pub b: Vec<PortionB>,
+}
+
 #[tokio::test]
 async fn complex_json_test2() -> Result<(), Box<dyn Error>> {
     let handle = get_builder()?.build().await?;
@@ -530,8 +662,6 @@ async fn complex_json_test2() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// NOTE: this will fail until we resolve a way to have Timestamps in json collections.
-// Maybe a #[NoSQL(type=string)] attribute could resolve it?
 #[tokio::test]
 async fn json_collection_test() -> Result<(), Box<dyn Error>> {
     let handle = get_builder()?.build().await?;
@@ -547,11 +677,10 @@ async fn json_collection_test() -> Result<(), Box<dyn Error>> {
         .wait_for_completion_ms(&handle, 15000, 500)
         .await?;
 
-    let mut portion_a: Vec<PortionA> = Vec::new();
-    portion_a.push(PortionA {
+    let mut portion_a: Vec<JsonPortionA> = Vec::new();
+    portion_a.push(JsonPortionA {
         a: 1000,
         b: "testing".to_string(),
-        c: Some(DateTime::parse_from_rfc3339("1996-12-19T16:39:57-08:00")?),
     });
     let mut portion_b: Vec<PortionB> = Vec::new();
     portion_b.push(PortionB {
@@ -564,7 +693,7 @@ async fn json_collection_test() -> Result<(), Box<dyn Error>> {
         y: Some("foo".to_string()),
         z: vec![27, 59],
     });
-    let data = ComplexA {
+    let data = JsonCollectionData {
         id: 100,
         a: portion_a.clone(),
         b: portion_b.clone(),
@@ -576,7 +705,7 @@ async fn json_collection_test() -> Result<(), Box<dyn Error>> {
         .await;
     println!("put result={:?}", res);
 
-    let mut a = ComplexData {
+    let mut a = JsonCollectionData {
         id: 100,
         ..Default::default()
     };

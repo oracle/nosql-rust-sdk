@@ -31,6 +31,11 @@ pub trait AuthenticationProvider: Send + Sync + Debug + AuthenticationProviderCl
     }
     /// Returns the region-id associated with this AuthenticationProvider
     fn region_id(&self) -> &str;
+    /// Returns true if this AuthenticationProvider should be refreshed before
+    /// it is used to sign another request.
+    fn should_refresh(&self) -> bool {
+        false
+    }
 }
 
 // This allows users of this library to clone a Box<dyn AuthenticationProvider>

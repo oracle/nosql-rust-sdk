@@ -339,8 +339,9 @@ impl RemoteScanner {
         );
         let mut vr: Vec<MapValue> = Vec::new();
         req_copy
-            .execute_batch_internal(handle, &mut vr, data)
+            .execute_batch_internal(handle, &mut vr, data, false)
             .await?;
+        let reached_limit = req_copy.reached_limit || req_copy.continuation_key.is_some();
         debug!(
             "EBI returned {} results (shard={}): {:?}",
             vr.len(),
@@ -348,6 +349,7 @@ impl RemoteScanner {
             vr
         );
         self.add_results(VecDeque::from(vr), req_copy.continuation_key);
+        req.reached_limit = reached_limit;
         req.consumed_capacity.add(&req_copy.consumed_capacity);
 
         // TODO: if (theVirtualScan != null && theVirtualScan.isFirstBatch()) {
@@ -656,7 +658,7 @@ impl ReceiveIter {
         debug!("ReceiveIter init_partition_sort executing internal request copy:\n");
         let mut vr: Vec<MapValue> = Vec::new();
         req_copy
-            .execute_batch_internal(handle, &mut vr, &mut self.data)
+            .execute_batch_internal(handle, &mut vr, &mut self.data, false)
             .await?;
         let mut results = VecDeque::from(vr);
         req.consumed_capacity.add(&req_copy.consumed_capacity);
@@ -683,8 +685,14 @@ impl ReceiveIter {
                 return ia_err!("expected more results than we got");
             }
 
-            let mut part_results: VecDeque<MapValue> =
-                VecDeque::with_capacity(num_results as usize);
+            let num_results = num_results as usize;
+            let mut part_results: VecDeque<MapValue> = VecDeque::new();
+            part_results.try_reserve(num_results).map_err(|_| {
+                NoSQLError::new(
+                    BadProtocolMessage,
+                    "unable to reserve decoded values for partition results",
+                )
+            })?;
             for _j in 0..num_results {
                 if let Some(r) = results.pop_front() {
                     part_results.push_back(r);

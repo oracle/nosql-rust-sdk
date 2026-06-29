@@ -6,13 +6,15 @@
 //
 use crate::error::ia_err;
 use crate::error::NoSQLError;
+use crate::error::NoSQLErrorCode;
 use crate::handle::Handle;
 use crate::handle::SendOptions;
 use crate::nson::*;
 use crate::plan_iter::{deserialize_plan_iter, PlanIterKind, PlanIterState};
-use crate::prepared_statement::PreparedStatement;
+use crate::prepared_statement::{PreparedStatement, PreparedStatementBranch};
 use crate::reader::Reader;
 use crate::receive_iter::ReceiveIterData;
+use crate::stats::QueryStatsMetadata;
 use crate::types::NoSQLColumnToFieldValue;
 use crate::types::{Capacity, Consistency, FieldType, FieldValue, MapValue, OpCode, TopologyInfo};
 use crate::writer::Writer;
@@ -21,6 +23,64 @@ use std::collections::HashMap;
 use std::result::Result;
 use std::time::Duration;
 use tracing::trace;
+
+const DRIVER_QUERY_VERSION: i32 = 6;
+
+fn is_retryable_query_statement(statement: &str) -> bool {
+    matches!(
+        first_sql_operation_keyword(statement).as_deref(),
+        Some("select")
+    )
+}
+
+fn first_sql_operation_keyword(statement: &str) -> Option<String> {
+    let (keyword, mut remaining) = split_leading_sql_keyword(statement)?;
+    let keyword = keyword.to_ascii_lowercase();
+    if keyword != "declare" {
+        return Some(keyword);
+    }
+
+    loop {
+        let declaration_end = remaining.find(';')?;
+        remaining = trim_sql_leading_noise(&remaining[declaration_end + 1..]);
+        if remaining.starts_with('$') {
+            continue;
+        }
+        return first_sql_operation_keyword(remaining);
+    }
+}
+
+fn split_leading_sql_keyword(statement: &str) -> Option<(&str, &str)> {
+    let statement = trim_sql_leading_noise(statement);
+    let end = statement
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(statement.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&statement[..end], &statement[end..]))
+}
+
+fn trim_sql_leading_noise(mut statement: &str) -> &str {
+    loop {
+        let trimmed = statement.trim_start();
+        if let Some(comment) = trimmed.strip_prefix("--") {
+            if let Some(end) = comment.find('\n') {
+                statement = &comment[end + 1..];
+                continue;
+            }
+            return "";
+        }
+        if let Some(comment) = trimmed.strip_prefix("/*") {
+            if let Some(end) = comment.find("*/") {
+                statement = &comment[end + 2..];
+                continue;
+            }
+            return "";
+        }
+        return trimmed;
+    }
+}
 
 /// Encapsulates a SQL query of a NoSQL Database table.
 ///
@@ -83,6 +143,9 @@ pub struct QueryRequest {
     // statement specifies a query statement.
     statement: Option<String>,
 
+    get_query_plan: bool,
+    get_query_schema: bool,
+
     // prepared_statement specifies the prepared query statement.
     pub(crate) prepared_statement: PreparedStatement,
 
@@ -125,6 +188,10 @@ pub struct QueryRequest {
     pub(crate) registers: Vec<FieldValue>,
 
     pub(crate) topology_info: TopologyInfo,
+
+    // Active UNION branch for internal ReceiveIter requests. When set, the
+    // copied internal QueryRequest uses the matching branch prepared query.
+    active_query_branch: Option<usize>,
 }
 
 /// Struct representing the result of a query operation.
@@ -228,6 +295,18 @@ impl QueryRequest {
         self
     }
 
+    /// Specify whether a prepare-only request should return the string query plan.
+    pub fn get_query_plan(mut self, get_query_plan: bool) -> Self {
+        self.get_query_plan = get_query_plan;
+        self
+    }
+
+    /// Specify whether a prepare-only request should return the JSON result schema.
+    pub fn get_query_schema(mut self, get_query_schema: bool) -> Self {
+        self.get_query_schema = get_query_schema;
+        self
+    }
+
     /// Specify the timeout value for the request.
     ///
     /// This is optional.
@@ -294,6 +373,30 @@ impl QueryRequest {
     pub fn max_write_kb(mut self, max: u32) -> Self {
         self.max_write_kb = max;
         self
+    }
+
+    fn rate_limit_table_name(&self) -> String {
+        self.prepared_statement
+            .table_name
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn does_writes_for_rate_limiting(&self) -> bool {
+        self.prepared_statement.does_writes()
+    }
+
+    fn is_retryable(&self) -> bool {
+        if self.prepare_only {
+            return true;
+        }
+        if !self.prepared_statement.is_empty() {
+            return !self.prepared_statement.does_writes();
+        }
+        self.statement
+            .as_deref()
+            .map(is_retryable_query_statement)
+            .unwrap_or(false)
     }
 
     // used by ext_var_ref_iter
@@ -385,14 +488,27 @@ impl QueryRequest {
         }
         QueryRequest {
             is_internal: true,
-            prepared_statement: self.prepared_statement.copy_for_internal(),
+            max_read_kb: self.max_read_kb,
+            max_write_kb: self.max_write_kb,
+            consistency: self.consistency,
+            compartment_id: self.compartment_id.clone(),
+            prepared_statement: self
+                .prepared_statement
+                .copy_for_internal(self.active_query_branch),
             shard_id: self.shard_id,
             //limit: self.limit,
             // purposefully not copying registers
             num_registers: -1,
             timeout: self.timeout.clone(),
+            topology_info: self.topology_info.clone(),
             ..Default::default()
         }
+    }
+
+    pub(crate) fn set_active_query_branch(&mut self, branch: Option<usize>) -> Option<usize> {
+        let previous = self.active_query_branch;
+        self.active_query_branch = branch;
+        previous
     }
 
     pub(crate) fn reset(&mut self) -> Result<(), NoSQLError> {
@@ -402,6 +518,47 @@ impl QueryRequest {
         self.consumed_capacity = Capacity::default();
         // clear prepared statement iterators
         self.prepared_statement.reset()
+    }
+
+    fn query_stats_metadata(&self) -> QueryStatsMetadata {
+        let is_prepared = !self.prepared_statement.is_empty();
+        let query = self
+            .statement
+            .clone()
+            .or_else(|| {
+                let sql_text = self.prepared_statement.sql_text();
+                if sql_text.is_empty() {
+                    None
+                } else {
+                    Some(sql_text.to_string())
+                }
+            })
+            .unwrap_or_else(|| "null".to_string());
+
+        QueryStatsMetadata::new(
+            query,
+            !is_prepared,
+            is_prepared && self.prepared_statement.is_simple_query(),
+            is_prepared && self.prepared_statement.does_writes(),
+            if is_prepared {
+                self.prepared_statement.print_driver_plan()
+            } else {
+                None
+            },
+        )
+    }
+
+    fn remember_sql_text_for_stats(&mut self) {
+        if let Some(statement) = &self.statement {
+            self.prepared_statement.set_sql_text(statement);
+        }
+    }
+
+    fn validate_query_input_for_stats(&self) -> Result<(), NoSQLError> {
+        if self.statement.is_none() && self.prepared_statement.is_empty() {
+            return ia_err!("no statement or prepared statement");
+        }
+        Ok(())
     }
 
     /// Set a named bind variable for execution of a prepared query.
@@ -468,10 +625,12 @@ impl QueryRequest {
         let mut iter_data = ReceiveIterData::default();
         let mut results: Vec<MapValue> = Vec::new();
         self.reset()?;
+        let mut observe_logical_query = !self.is_internal && !self.prepare_only;
         while self.is_done == false {
             //println!("execute_internal doing next batch");
-            self.execute_batch_internal(h, &mut results, &mut iter_data)
+            self.execute_batch_internal(h, &mut results, &mut iter_data, observe_logical_query)
                 .await?;
+            observe_logical_query = false;
             self.batch_counter += 1;
             if self.batch_counter > 10000 {
                 panic!("Batch_internal infinite loop detected: self={:?}", self);
@@ -506,7 +665,8 @@ impl QueryRequest {
         results: &mut Vec<MapValue>,
     ) -> Result<(), NoSQLError> {
         let mut _data = ReceiveIterData::default();
-        self.execute_batch_internal(handle, results, &mut _data)
+        let observe_logical_query = !self.is_internal && !self.prepare_only;
+        self.execute_batch_internal(handle, results, &mut _data, observe_logical_query)
             .await
     }
 
@@ -524,6 +684,7 @@ impl QueryRequest {
         handle: &Handle,
         results: &mut Vec<MapValue>,
         iter_data: &mut ReceiveIterData,
+        observe_logical_query: bool,
     ) -> Result<(), NoSQLError> {
         trace!(
             "EBI: batch_counter={} num_results={}",
@@ -532,6 +693,16 @@ impl QueryRequest {
         );
 
         self.reached_limit = false;
+        if observe_logical_query {
+            self.validate_query_input_for_stats()?;
+            // Java records the logical query call after local validation but
+            // before the request goes on the wire, so network failures still
+            // count while malformed local requests do not.
+            handle
+                .inner
+                .stats_control
+                .observe_query(self.query_stats_metadata());
+        }
 
         // internal queries do not use plan iterators/etc - they just return plain results.
         if self.is_internal == false {
@@ -589,15 +760,50 @@ impl QueryRequest {
         w.write_i16(handle.inner.serial_version);
         let timeout = handle.get_timeout(&self.timeout);
         self.serialize_internal(&mut w, &timeout)?;
+        let consumed_before = self.consumed_capacity;
         let mut opts = SendOptions {
             timeout: timeout,
-            retryable: true,
+            retryable: self.is_retryable(),
+            request_name: if self.prepare_only {
+                "Prepare"
+            } else {
+                "Query"
+            },
+            // A prepare-only request contributes to aggregate Prepare stats,
+            // but Java does not create an ALL-profile query entry for it.
+            // Non-internal Query requests carry metadata that links each HTTP
+            // request back to the logical query entry.
+            query_stats: if self.is_internal || self.prepare_only {
+                None
+            } else {
+                Some(self.query_stats_metadata())
+            },
             compartment_id: self.compartment_id.clone(),
+            table_name: self.rate_limit_table_name(),
+            does_reads: true,
+            does_writes: self.does_writes_for_rate_limiting(),
             ..Default::default()
         };
         let mut r = handle.send_and_receive(w, &mut opts).await?;
         self.continuation_key = None;
         self.nson_deserialize(&mut r, results, iter_data)?;
+        let batch_consumed = self.consumed_capacity.delta_since(&consumed_before);
+        let table_name = self.rate_limit_table_name();
+        if !table_name.is_empty() {
+            handle
+                .consume_rate_limited_capacity(&mut opts, &table_name, &batch_consumed)
+                .await;
+        }
+        self.remember_sql_text_for_stats();
+        if !self.is_internal && !self.prepare_only {
+            // Response metadata can fill in query attributes that are only
+            // known after prepare/deserialize, without incrementing the
+            // logical query count again.
+            handle
+                .inner
+                .stats_control
+                .observe_query_metadata(self.query_stats_metadata());
+        }
         if self.continuation_key.is_none() {
             trace!("continuation key is None, setting is_done");
             self.is_done = true;
@@ -637,7 +843,15 @@ impl QueryRequest {
         //writeMapField(ns, TRACE_AT_LOG_FILES, rq.getLogFileTracing());
         //writeMapField(ns, BATCH_COUNTER, rq.getBatchCounter());
 
-        ns.write_i32_field(QUERY_VERSION, 3); // TODO: QUERY_V4
+        ns.write_i32_field(QUERY_VERSION, DRIVER_QUERY_VERSION);
+        if self.prepare_only {
+            if self.get_query_plan {
+                ns.write_bool_field(GET_QUERY_PLAN, true);
+            }
+            if self.get_query_schema {
+                ns.write_bool_field(GET_QUERY_SCHEMA, true);
+            }
+        }
         if self.prepared_statement.is_empty() == false {
             ns.write_bool_field(IS_PREPARED, true);
             ns.write_bool_field(IS_SIMPLE_QUERY, self.prepared_statement.is_simple());
@@ -707,9 +921,11 @@ impl QueryRequest {
         walker.r.read_i32()?; // length of array in bytes
         let num_elements = walker.r.read_i32()?;
         trace!("read_results: num_results={}", num_elements);
-        if num_elements <= 0 {
+        let num_elements = walker.r.checked_count(num_elements, "query results")?;
+        if num_elements == 0 {
             return Ok(());
         }
+        Reader::try_reserve_vec(results, num_elements, "query results")?;
         for _i in 0..num_elements {
             if let FieldValue::Map(m) = walker.r.read_field_value()? {
                 //println!("Result: {:?}", m);
@@ -768,6 +984,20 @@ impl QueryRequest {
                         return ia_err!("got prepared query in result for already prepared query");
                     }
                     self.prepared_statement.statement = walker.read_nson_binary()?;
+                }
+                QUERY_BRANCHES => {
+                    if is_prepared_request {
+                        return ia_err!("got query branches in result for already prepared query");
+                    }
+                    self.prepared_statement.branches = Self::read_query_branches(&mut walker)?;
+                    if self.prepared_statement.statement.is_empty()
+                        && self.prepared_statement.branches.len() > 0
+                    {
+                        let branch = &self.prepared_statement.branches[0];
+                        self.prepared_statement.statement = branch.statement.clone();
+                        self.prepared_statement.table_name = branch.table_name.clone();
+                        self.prepared_statement.namespace = branch.namespace.clone();
+                    }
                 }
                 DRIVER_QUERY_PLAN => {
                     if is_prepared_request {
@@ -866,6 +1096,40 @@ impl QueryRequest {
         Ok(())
     }
 
+    fn read_query_branches(
+        walker: &mut MapWalker,
+    ) -> Result<Vec<PreparedStatementBranch>, NoSQLError> {
+        let fv = walker.read_nson_field_value()?;
+        let branches = match fv {
+            FieldValue::Array(branches) => branches,
+            _ => {
+                return ia_err!("bad type in query branches: expected Array");
+            }
+        };
+
+        let mut result = Vec::with_capacity(branches.len());
+        for branch in branches {
+            let mv = match branch {
+                FieldValue::Map(mv) => mv,
+                _ => {
+                    return ia_err!("bad type in query branch: expected Map");
+                }
+            };
+            let statement = match mv.get_field_value(PREPARED_QUERY) {
+                Some(FieldValue::Binary(bytes)) => bytes.clone(),
+                _ => {
+                    return ia_err!("query branch is missing prepared query");
+                }
+            };
+            result.push(PreparedStatementBranch {
+                statement,
+                table_name: mv.get_string(TABLE_NAME),
+                namespace: mv.get_string(NAMESPACE),
+            });
+        }
+        Ok(result)
+    }
+
     fn get_driver_plan_info(&mut self, v: &Vec<u8>) -> Result<(), NoSQLError> {
         if v.len() == 0 {
             return Ok(());
@@ -879,21 +1143,32 @@ impl QueryRequest {
         if self.prepared_statement.driver_query_plan.get_kind() == PlanIterKind::Empty {
             return Ok(());
         }
-        self.prepared_statement.num_iterators = r.read_i32()?;
+        let num_iterators = r.read_i32()?;
+        Reader::checked_count_with_limit(num_iterators, v.len(), "driver plan iterators")?;
+        self.prepared_statement.num_iterators = num_iterators;
         //println!(
         //"   QUERY_PLAN: iterators={}",
         //self.prepared_statement.num_iterators
         //);
-        self.prepared_statement.num_registers = r.read_i32()?;
+        let num_registers = r.read_i32()?;
+        Reader::checked_count_with_limit(num_registers, v.len(), "driver plan registers")?;
+        self.prepared_statement.num_registers = num_registers;
         //println!(
         //"   QUERY_PLAN: registers={}",
         //self.prepared_statement.num_registers
         //);
         let len = r.read_i32()?;
-        if len <= 0 {
+        let len = r.checked_count(len, "driver plan variables")?;
+        if len == 0 {
             return Ok(());
         }
-        let mut hm: HashMap<String, i32> = HashMap::with_capacity(len as usize);
+        let mut hm: HashMap<String, i32> = HashMap::new();
+        hm.try_reserve(len).map_err(|_| {
+            NoSQLError::new(
+                NoSQLErrorCode::BadProtocolMessage,
+                "unable to reserve decoded values for driver plan variables",
+            )
+        })?;
         for _i in 0..len {
             let name = r.read_string()?;
             let id = r.read_i32()?;
@@ -922,29 +1197,236 @@ impl QueryRequest {
     }
 
     pub(crate) fn get_result(&mut self, reg: i32) -> FieldValue {
-        if self.num_registers <= reg {
-            panic!("INVALID GET REGISTER ACCESS");
-        }
+        let reg = self.register_index(reg, "GET");
         //println!(
         //" get_result register {}: {:?}",
         //reg, self.registers[reg as usize]
         //);
-        std::mem::take(&mut self.registers[reg as usize])
+        std::mem::take(&mut self.registers[reg])
     }
 
     pub(crate) fn get_result_ref(&self, reg: i32) -> &FieldValue {
+        let reg = self.register_index(reg, "GET");
         //println!(
         //" get_result_ref register {}: {:?}",
         //reg, self.registers[reg as usize]
         //);
-        &self.registers[reg as usize]
+        &self.registers[reg]
     }
 
     pub(crate) fn set_result(&mut self, reg: i32, val: FieldValue) {
-        if self.num_registers <= reg {
-            panic!("INVALID SET REGISTER ACCESS");
-        }
+        let reg = self.register_index(reg, "SET");
         //println!(" set_result register {}: {:?}", reg, val);
-        self.registers[reg as usize] = val;
+        self.registers[reg] = val;
+    }
+
+    fn register_index(&self, reg: i32, op: &str) -> usize {
+        if reg < 0 || self.num_registers <= reg {
+            panic!("INVALID {} REGISTER ACCESS", op);
+        }
+        reg as usize
+    }
+}
+
+#[cfg(test)]
+mod retryability_tests {
+    use super::*;
+
+    #[test]
+    fn query_retryability_classifies_statement_text() {
+        assert!(QueryRequest::new("select * from users").is_retryable());
+        assert!(QueryRequest::new("  -- comment\n/* block */ SELECT * from users").is_retryable());
+        assert!(QueryRequest::new(
+            "declare $id integer; $name string; select * from users where id = $id"
+        )
+        .is_retryable());
+
+        assert!(!QueryRequest::new("insert into users(id) values(1)").is_retryable());
+        assert!(!QueryRequest::new("UPSERT into users(id) values(1)").is_retryable());
+        assert!(!QueryRequest::new("update users set name = 'a' where id = 1").is_retryable());
+        assert!(!QueryRequest::new("delete from users where id = 1").is_retryable());
+        assert!(!QueryRequest::new(
+            "declare $id integer; $name string; insert into users(id, name) values($id, $name)"
+        )
+        .is_retryable());
+        assert!(!QueryRequest::new("").is_retryable());
+    }
+
+    #[test]
+    fn prepare_only_queries_are_retryable_without_executing_mutation() {
+        assert!(QueryRequest::new("insert into users(id) values(1)")
+            .prepare_only()
+            .is_retryable());
+    }
+
+    #[test]
+    fn query_retryability_uses_prepared_operation_code() {
+        let mut prepared_select = PreparedStatement::default();
+        prepared_select.statement = vec![1];
+        prepared_select.operation = 5;
+        assert!(QueryRequest::new_prepared(&prepared_select).is_retryable());
+
+        let mut prepared_mutation = prepared_select.clone();
+        prepared_mutation.operation = 0;
+        assert!(!QueryRequest::new_prepared(&prepared_mutation).is_retryable());
+    }
+
+    #[test]
+    #[should_panic(expected = "INVALID GET REGISTER ACCESS")]
+    fn negative_query_register_is_rejected_before_indexing() {
+        let mut request = QueryRequest::default();
+        request.num_registers = 1;
+        request.registers.push(FieldValue::Uninitialized);
+
+        let _ = request.get_result(-1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nson::{GET_QUERY_PLAN, GET_QUERY_SCHEMA, PAYLOAD, QUERY_VERSION, STATEMENT};
+    use crate::{Handle, HandleMode, StatsProfile};
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    fn serialized_payload_fields(request: &QueryRequest) -> (Vec<String>, HashMap<String, bool>) {
+        let mut writer = Writer::new();
+        request
+            .serialize_internal(&mut writer, &Duration::from_secs(30))
+            .unwrap();
+        let mut reader = Reader::new().from_bytes(writer.bytes());
+        let mut root = MapWalker::new(&mut reader).unwrap();
+
+        while root.has_next() {
+            root.next().unwrap();
+            let name = root.current_name().clone();
+            if name != PAYLOAD {
+                root.skip_nson_field().unwrap();
+                continue;
+            }
+
+            let mut payload = MapWalker::new(root.r).unwrap();
+            let mut fields = Vec::new();
+            let mut bools = HashMap::new();
+            while payload.has_next() {
+                payload.next().unwrap();
+                let field = payload.current_name().clone();
+                fields.push(field.clone());
+                match field.as_str() {
+                    GET_QUERY_PLAN | GET_QUERY_SCHEMA => {
+                        bools.insert(field, payload.read_nson_boolean().unwrap());
+                    }
+                    _ => payload.skip_nson_field().unwrap(),
+                }
+            }
+            return (fields, bools);
+        }
+
+        panic!("serialized query request did not contain payload");
+    }
+
+    fn contains_field(fields: &[String], field: &str) -> bool {
+        fields.iter().any(|name| name == field)
+    }
+
+    #[test]
+    fn prepare_only_serializes_query_plan_and_schema_flags_when_requested() {
+        let request = QueryRequest::new("select * from users")
+            .prepare_only()
+            .get_query_plan(true)
+            .get_query_schema(true);
+
+        let (fields, bools) = serialized_payload_fields(&request);
+
+        assert!(contains_field(&fields, QUERY_VERSION));
+        assert!(contains_field(&fields, STATEMENT));
+        assert_eq!(bools.get(GET_QUERY_PLAN), Some(&true));
+        assert_eq!(bools.get(GET_QUERY_SCHEMA), Some(&true));
+
+        let request = QueryRequest::new("select * from users").prepare_only();
+        let (fields, bools) = serialized_payload_fields(&request);
+
+        assert!(!contains_field(&fields, GET_QUERY_PLAN));
+        assert!(!contains_field(&fields, GET_QUERY_SCHEMA));
+        assert!(bools.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_batch_rejects_invalid_request_without_query_stats(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let handle = Handle::builder()
+            .endpoint("http://localhost:8080")?
+            .mode(HandleMode::Cloudsim)?
+            .stats_profile(StatsProfile::All)?
+            .stats_enable_log(false)?
+            .build()
+            .await?;
+
+        let mut request = QueryRequest::default();
+        let mut results = Vec::new();
+
+        // Java validates query input before observeQuery(), so malformed local
+        // requests must not create an ALL-profile logical query entry.
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+
+        let snapshot: Value = serde_json::from_str(
+            handle
+                .get_stats_control()
+                .emit_interval_for_test()
+                .unwrap()
+                .as_json(),
+        )?;
+
+        assert!(snapshot.get("queries").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_batch_counts_each_valid_public_batch_attempt_as_logical_query(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let handle = Handle::builder()
+            .endpoint("http://127.0.0.1:9")?
+            .mode(HandleMode::Cloudsim)?
+            .timeout(Duration::from_millis(50))?
+            .stats_profile(StatsProfile::All)?
+            .stats_enable_log(false)?
+            .build()
+            .await?;
+
+        let mut request = QueryRequest::new("select * from users");
+        let mut results = Vec::new();
+
+        // The request is locally valid, so each public execute_batch() attempt
+        // counts as a logical query even when the local test endpoint is absent.
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+
+        let snapshot: Value = serde_json::from_str(
+            handle
+                .get_stats_control()
+                .emit_interval_for_test()
+                .unwrap()
+                .as_json(),
+        )?;
+
+        let query = query_entry(&snapshot, "select * from users").unwrap();
+        assert_eq!(query["query"], "select * from users");
+        assert_eq!(query["count"], 2);
+        assert_eq!(query["unprepared"], 2);
+        assert_eq!(query["httpRequestCount"], 2);
+        assert_eq!(query["errors"], 2);
+        assert_eq!(query["simple"], false);
+
+        Ok(())
+    }
+
+    fn query_entry<'a>(snapshot: &'a Value, sql: &str) -> Option<&'a Value> {
+        snapshot["queries"]
+            .as_array()?
+            .iter()
+            .find(|query| query["query"] == sql)
     }
 }

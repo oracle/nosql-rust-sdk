@@ -1,7 +1,7 @@
 [package]
 name = "oracle-nosql-rust-sdk"
-version = "0.1.3"
-rust-version = "1.78"
+version = "0.1.4"
+rust-version = "1.88"
 license = "UPL-1.0"
 description = "Oracle Rust SDK for the NoSQL Database"
 keywords = ["nosql", "oracle", "database"]
@@ -26,7 +26,7 @@ serde = "1.0.200"
 serde_derive = "1.0.200"
 dirs = "5.0.1"
 serde_json = { version = "1.0.128", features = ["arbitrary_precision"] }
-bigdecimal = "0.4.5"
+bigdecimal = "0.4.6"
 derive_builder = { version = "0.20.0" }
 oracle-nosql-rust-sdk-derive = { version = "0.1" }
 async-recursion = "1.1.1"

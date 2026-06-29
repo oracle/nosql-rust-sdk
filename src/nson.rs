@@ -97,6 +97,7 @@ pub const QUERY_OPERATION: &str = "qo";
 pub const QUERY_PLAN_STRING: &str = "qs";
 pub const QUERY_RESULTS: &str = "qr";
 pub const QUERY_RESULT_SCHEMA: &str = "qc";
+pub const QUERY_BRANCHES: &str = "qb";
 pub const QUERY_VERSION: &str = "qv";
 pub const RANGE: &str = "rg";
 pub const RANGE_PATH: &str = "rp";
@@ -154,6 +155,9 @@ pub trait NsonRequest {
 
 pub trait NsonSubRequest: std::fmt::Debug {
     fn serialize(&self, w: &mut Writer, timeout: &Duration);
+    fn does_reads(&self) -> bool {
+        false
+    }
 }
 
 // The base struct used for all serialization.
@@ -353,6 +357,7 @@ impl<'a> NsonSerializer<'a> {
             self.write_string_field(TABLE_NAME, table_name);
         }
         self.write_i32_field(OP_CODE, op_code as i32);
+        self.write_i32_field(TOPO_SEQ_NUM, -1);
         self.write_i32_field(TIMEOUT, timeout.as_millis() as i32);
     }
 
@@ -409,12 +414,13 @@ impl<'a> MapWalker<'a> {
         Self::expect_type(r, FieldType::Map)?;
         let _ = r.read_i32()?; // skip map size in bytes
         let num_elements = r.read_i32()?;
-        if num_elements < 0 || num_elements > MAX_ELEMENTS {
+        if num_elements > MAX_ELEMENTS {
             return Err(NoSQLError::new(
                 BadProtocolMessage,
                 "invalid num_elements in message",
             ));
         }
+        let num_elements = r.checked_count(num_elements, "map message")? as i32;
         //println!("MapWalker: num_elements={}", num_elements);
         Ok(MapWalker {
             r,
@@ -488,14 +494,10 @@ impl<'a> MapWalker<'a> {
         Self::expect_type(self.r, FieldType::Array)?;
         let _ = self.r.read_i32()?; // skip array size in bytes
         let num_elements = self.r.read_i32()?;
-        if num_elements < 0 || (num_elements as usize) > self.r.buf.len() {
-            return Err(NoSQLError::new(
-                BadProtocolMessage,
-                "invalid num_elements in string array",
-            ));
-        }
-        let mut v: Vec<String> = Vec::with_capacity(num_elements as usize);
-        for _n in 1..=num_elements {
+        let num_elements = self.r.checked_count(num_elements, "string array")?;
+        let mut v: Vec<String> = Vec::new();
+        Reader::try_reserve_vec(&mut v, num_elements, "string array")?;
+        for _n in 0..num_elements {
             v.push(self.read_nson_string()?);
         }
         //println!("read_nson_string_array={:?}", v);
@@ -506,14 +508,10 @@ impl<'a> MapWalker<'a> {
         Self::expect_type(self.r, FieldType::Array)?;
         let _ = self.r.read_i32()?; // skip array size in bytes
         let num_elements = self.r.read_i32()?;
-        if num_elements < 0 || (num_elements as usize) > self.r.buf.len() {
-            return Err(NoSQLError::new(
-                BadProtocolMessage,
-                "invalid num_elements in i32 array",
-            ));
-        }
-        let mut v: Vec<i32> = Vec::with_capacity(num_elements as usize);
-        for _n in 1..=num_elements {
+        let num_elements = self.r.checked_count(num_elements, "i32 array")?;
+        let mut v: Vec<i32> = Vec::new();
+        Reader::try_reserve_vec(&mut v, num_elements, "i32 array")?;
+        for _n in 0..num_elements {
             v.push(self.read_nson_i32()?);
         }
         //println!("read_nson_i32_array={:?}", v);

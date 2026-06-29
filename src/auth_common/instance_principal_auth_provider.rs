@@ -13,6 +13,9 @@ use reqwest::Method;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
+use std::fmt;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::{debug, instrument, trace};
 use url::Url;
@@ -22,8 +25,10 @@ use crate::auth_common::signer;
 
 static METADATA_URL_BASE: &str = "http://169.254.169.254/opc/v2";
 static EMPTY_STRING: &str = "";
+#[cfg(test)]
+static EXPECTED_NEW_WITH_CLIENT: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InstancePrincipalAuthProvider {
     token: String,
     session_private_key: Rsa<Private>,
@@ -31,6 +36,18 @@ pub struct InstancePrincipalAuthProvider {
     fingerprint: String,
     region: String,
     //expiration: u64, // seconds since the epoch
+}
+
+impl fmt::Debug for InstancePrincipalAuthProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InstancePrincipalAuthProvider")
+            .field("token", &"[redacted]")
+            .field("session_private_key", &"[redacted]")
+            .field("tenancy_id", &self.tenancy_id)
+            .field("fingerprint", &self.fingerprint)
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 impl AuthenticationProvider for InstancePrincipalAuthProvider {
@@ -56,14 +73,32 @@ impl AuthenticationProvider for InstancePrincipalAuthProvider {
 }
 
 impl InstancePrincipalAuthProvider {
-    pub async fn new() -> Result<InstancePrincipalAuthProvider, Box<dyn Error>> {
-        InstancePrincipalAuthProvider::new_with_client(&reqwest::Client::builder().build()?).await
+    #[cfg(test)]
+    pub(crate) fn expect_next_new_with_client_for_test(client: &reqwest::Client) {
+        EXPECTED_NEW_WITH_CLIENT.store(client as *const reqwest::Client as usize, Ordering::SeqCst);
     }
 
     #[instrument(skip(client))]
     pub async fn new_with_client(
         client: &reqwest::Client,
     ) -> Result<InstancePrincipalAuthProvider, Box<dyn Error>> {
+        #[cfg(test)]
+        {
+            let expected = EXPECTED_NEW_WITH_CLIENT.swap(0, Ordering::SeqCst);
+            if expected != 0 {
+                let actual = client as *const reqwest::Client as usize;
+                let message = if actual == expected {
+                    "test marker: instance principal used supplied client".to_string()
+                } else {
+                    format!(
+                        "test marker: instance principal used unexpected client {:x}, expected {:x}",
+                        actual, expected
+                    )
+                };
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, message).into());
+            }
+        }
+
         let mut auth_headers: HeaderMap = HeaderMap::new();
         auth_headers.insert("Authorization", "Bearer Oracle".parse()?);
 
@@ -77,7 +112,7 @@ impl InstancePrincipalAuthProvider {
             .await?
             .text()
             .await?;
-        trace!("Leaf certificate: {:?}", leaf_certificate);
+        trace!("received leaf certificate: len={}", leaf_certificate.len());
 
         let leaf_certificate_private_key_url: &str =
             &format!("{}/identity/key.pem", METADATA_URL_BASE);
@@ -163,25 +198,22 @@ async fn get_instance_metadata(
 fn get_tenancy_id_from_certificate(cert: &str) -> Result<String, Box<dyn Error>> {
     let cert = cert.as_bytes();
     let cert = X509::from_pem(cert)?;
-    let mut subject = String::from_utf8_lossy(&cert.to_text()?).into_owned();
 
-    // In text form, the cert contains a Subject line like this:
-    // Subject: CN=ocid1.instance.oc1.eu-zurich-1.an5heljrckmxu5ichjk4nyxrwqg3abrsafgyh4niyl6vs3lmdjfjio3t463a, OU=opc-certtype:instance, OU=opc-compartment:ocid1.tenancy.oc1..aaaaaaaattuxbj75pnn3nksvzyidshdbrfmmeflv4kkemajroz2thvca4kba, OU=opc-instance:ocid1.instance.oc1.eu-zurich-1.an5heljrckmxu5ichjk4nyxrwqg3abrsafgyh4niyl6vs3lmdjfjio3t463a, OU=opc-tenant:ocid1.tenancy.oc1..aaaaaaaattuxbj75pnn3nksvzyidshdbrfmmeflv4kkemajroz2thvca4kba
-    // This code attempts to extract the 'opc-tenant:____________' value
-    // Note the cert also has the compartment ocid as well, which may be useful for users of this library
+    // Instance principal certificates carry the tenancy as an X509 subject value
+    // such as OU=opc-tenant:ocid1.tenancy.oc1...
+    for entry in cert.subject_name().entries() {
+        let value = match entry.data().as_utf8() {
+            Ok(value) => value.to_string(),
+            Err(_) => continue,
+        };
 
-    if let Some(off) = subject.find("=opc-tenant:ocid1.tenancy.") {
-        // 12 == length of "=opc-tenant:"
-        let mut tenancy_id = subject.split_off(off + 12);
-        // strip trailing: start at comma, newline, or space
-        for i in [',', ' ', '\n', '\r'] {
-            if let Some(coff) = tenancy_id.find(i) {
-                let _ = tenancy_id.split_off(coff - 1);
+        if let Some(tenancy_id) = value.strip_prefix("opc-tenant:") {
+            if tenancy_id.starts_with("ocid1.tenancy.") {
+                return Ok(tenancy_id.to_string());
             }
         }
-        //println!("tenancy='{}'", tenancy_id);
-        return Ok(tenancy_id);
     }
+
     return Err("Cannot find tenancy id in certificate".into());
 }
 
@@ -253,24 +285,17 @@ async fn get_security_token_from_auth_service(
         HashMap::new(),
         false,
     )?;
-    trace!(
-        "Sending http post request to {} \n with headers : {:?}",
-        url,
-        required_headers
-    );
+    trace!("sending IAM auth token request to {}", url);
     let response = client
         .post(url)
         .body(jwt_request_body)
         .headers(required_headers)
         .send()
         .await?;
-    trace!("Response received from the service : {:?}", response);
-    if !response.status().is_success() {
-        return Err(format!(
-            "IAM auth service returned status {}",
-            response.status().as_str()
-        )
-        .into());
+    let status = response.status();
+    trace!("IAM auth service response status: {}", status);
+    if !status.is_success() {
+        return Err(format!("IAM auth service returned status {}", status.as_str()).into());
     }
 
     let rtext = response.text().await?;
@@ -299,3 +324,78 @@ pub fn now_in_secs() -> u64 {
 //let response = sdk_client.get(url_data).await;
 //response
 //}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openssl::asn1::{Asn1Integer, Asn1Time};
+    use openssl::bn::BigNum;
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+    use openssl::x509::X509NameBuilder;
+
+    #[test]
+    fn debug_redacts_token_and_private_key() {
+        let provider = InstancePrincipalAuthProvider {
+            token: "ST$secret-security-token".to_string(),
+            session_private_key: Rsa::generate(2048).unwrap(),
+            tenancy_id: "tenancy".to_string(),
+            fingerprint: "fingerprint".to_string(),
+            region: "region".to_string(),
+        };
+
+        let debug = format!("{:?}", provider);
+
+        assert!(!debug.contains("secret-security-token"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn tenancy_id_from_certificate_preserves_last_character_before_next_subject_entry() {
+        let tenancy_id = "ocid1.tenancy.oc1..abcdefghijklmnopqrstu";
+        let cert = test_certificate_with_subject_entries(&[
+            (Nid::COMMONNAME, "ocid1.instance.oc1.iad.example"),
+            (Nid::ORGANIZATIONALUNITNAME, "opc-certtype:instance"),
+            (
+                Nid::ORGANIZATIONALUNITNAME,
+                &format!("opc-tenant:{tenancy_id}"),
+            ),
+            (
+                Nid::ORGANIZATIONALUNITNAME,
+                "opc-instance:ocid1.instance.oc1.iad.example",
+            ),
+        ]);
+
+        let parsed = get_tenancy_id_from_certificate(&cert).unwrap();
+
+        assert_eq!(parsed, tenancy_id);
+    }
+
+    fn test_certificate_with_subject_entries(entries: &[(Nid, &str)]) -> String {
+        let rsa = Rsa::generate(2048).unwrap();
+        let pkey = PKey::from_rsa(rsa).unwrap();
+
+        let mut name_builder = X509NameBuilder::new().unwrap();
+        for (nid, value) in entries {
+            name_builder.append_entry_by_nid(*nid, value).unwrap();
+        }
+        let subject_name = name_builder.build();
+
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        let serial_number = BigNum::from_u32(1).unwrap();
+        let serial_number = Asn1Integer::from_bn(&serial_number).unwrap();
+        builder.set_serial_number(&serial_number).unwrap();
+        builder.set_subject_name(&subject_name).unwrap();
+        builder.set_issuer_name(&subject_name).unwrap();
+        builder.set_pubkey(&pkey).unwrap();
+        let not_before = Asn1Time::days_from_now(0).unwrap();
+        let not_after = Asn1Time::days_from_now(1).unwrap();
+        builder.set_not_before(&not_before).unwrap();
+        builder.set_not_after(&not_after).unwrap();
+        builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+
+        String::from_utf8(builder.build().to_pem().unwrap()).unwrap()
+    }
+}

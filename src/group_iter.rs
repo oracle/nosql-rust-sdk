@@ -13,8 +13,12 @@ use crate::plan_iter::deserialize_plan_iter;
 use crate::plan_iter::{FuncCode, Location, PlanIter, PlanIterKind, PlanIterState};
 use crate::query_request::QueryRequest;
 use crate::reader::Reader;
-use crate::types::{bd_try_from_f64, compare_atomics_total_order, FieldType, FieldValue, MapValue};
+use crate::types::{
+    bd_add_decimal32, bd_round_decimal32, bd_try_from_f64, compare_atomics_total_order,
+    compare_field_values, FieldType, FieldValue, MapValue,
+};
 
+use bigdecimal::BigDecimal;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -32,6 +36,7 @@ pub(crate) struct GroupIter {
     aggr_funcs: Vec<FuncCode>,
     remove_produced_result: bool,
     count_memory: bool,
+    is_regrouping: bool,
 
     data: GroupIterData,
 }
@@ -63,6 +68,7 @@ impl GroupIter {
         gi.is_distinct = r.read_bool()?;
         gi.remove_produced_result = r.read_bool()?;
         gi.count_memory = r.read_bool()?;
+        gi.is_regrouping = r.read_bool()?;
         Ok(gi)
     }
 }
@@ -97,12 +103,14 @@ struct AggrValue {
     func: FuncCode,
     value: AggrValueEnum,
     got_numeric_input: bool,
+    is_regrouping: bool,
 }
 
 impl AggrValue {
-    pub fn new(func: FuncCode) -> Self {
+    pub fn new(func: FuncCode, is_regrouping: bool) -> Self {
         let mut av = AggrValue::default();
         av.func = func;
+        av.is_regrouping = is_regrouping;
         match av.func {
             FuncCode::FnCountStar
             | FuncCode::FnCount
@@ -131,32 +139,38 @@ impl AggrValue {
         if val.is_null() {
             return;
         }
-        if val.get_type() != FieldType::Array {
-            panic!(
-                "Invalid FieldValue type in AggrValue::collect: expected Array, got {:?}",
-                val
-            );
-        }
         if let AggrValueEnum::Set(set) = &mut self.value {
             // ArrayCollectDistinct
-            if let FieldValue::Array(arr) = val {
-                set.extend(arr.into_iter());
-                //if count_memory {
-                //rcb.incMemoryConsumption(welem.sizeof() +
-                //SizeOf.HASHSET_ENTRY_OVERHEAD);
-                //}
+            if self.is_regrouping {
+                if let FieldValue::Array(arr) = val {
+                    set.extend(arr.into_iter());
+                } else {
+                    set.insert(val);
+                }
+            } else {
+                set.insert(val);
             }
+            //if count_memory {
+            //rcb.incMemoryConsumption(welem.sizeof() +
+            //SizeOf.HASHSET_ENTRY_OVERHEAD);
+            //}
         } else if let AggrValueEnum::Array(arr) = &mut self.value {
             // ArrayCollect
-            if let FieldValue::Array(varr) = val {
-                for i in varr.into_iter() {
-                    arr.push(i);
+            if self.is_regrouping {
+                if let FieldValue::Array(varr) = val {
+                    for i in varr.into_iter() {
+                        arr.push(i);
+                    }
+                } else {
+                    arr.push(val);
                 }
                 //if count_memory
                 //rcb.incMemoryConsumption(val.sizeof() +
                 //SizeOf.OBJECT_REF_OVERHEAD *
                 //arrayVal.size());
                 //}
+            } else {
+                arr.push(val);
             }
         } else {
             panic!(
@@ -198,7 +212,6 @@ impl AggrValue {
         ia_err!("can't increment aggrValue: not a Field")
     }
 
-    // TODO: add MathContext
     pub fn add(
         &mut self,
         _req: &QueryRequest,
@@ -210,7 +223,11 @@ impl AggrValue {
             return Ok(());
         }
         if self.value == AggrValueEnum::Uninitialized {
-            self.value = AggrValueEnum::Field(val.clone_internal());
+            let init_value = match val {
+                FieldValue::Number(n) => FieldValue::Number(bd_round_decimal32(n.clone())),
+                _ => val.clone_internal(),
+            };
+            self.value = AggrValueEnum::Field(init_value);
             return Ok(());
         }
         if let AggrValueEnum::Field(sum_value) = &mut self.value {
@@ -228,7 +245,9 @@ impl AggrValue {
                         self.value = AggrValueEnum::Field(FieldValue::Double(d));
                     }
                     FieldValue::Number(n) => {
-                        self.value = AggrValueEnum::Field(FieldValue::Number(n + *i));
+                        let rhs = BigDecimal::from(*i);
+                        self.value =
+                            AggrValueEnum::Field(FieldValue::Number(bd_add_decimal32(n, &rhs)));
                     }
                     _ => {
                         return ia_err!("can't add non-numeric to numeric");
@@ -246,7 +265,9 @@ impl AggrValue {
                         self.value = AggrValueEnum::Field(FieldValue::Double(d));
                     }
                     FieldValue::Number(n) => {
-                        self.value = AggrValueEnum::Field(FieldValue::Number(n + *l));
+                        let rhs = BigDecimal::from(*l);
+                        self.value =
+                            AggrValueEnum::Field(FieldValue::Number(bd_add_decimal32(n, &rhs)));
                     }
                     _ => {
                         return ia_err!("can't add non-numeric to numeric");
@@ -264,7 +285,8 @@ impl AggrValue {
                     }
                     FieldValue::Number(n) => {
                         let bd = bd_try_from_f64(*d)?;
-                        self.value = AggrValueEnum::Field(FieldValue::Number(n + bd));
+                        self.value =
+                            AggrValueEnum::Field(FieldValue::Number(bd_add_decimal32(n, &bd)));
                     }
                     _ => {
                         return ia_err!("can't add non-numeric to numeric");
@@ -272,16 +294,19 @@ impl AggrValue {
                 },
                 FieldValue::Number(n) => match val {
                     FieldValue::Integer(vi) => {
-                        *n += *vi;
+                        let rhs = BigDecimal::from(*vi);
+                        *n = bd_add_decimal32(n, &rhs);
                     }
                     FieldValue::Long(vl) => {
-                        *n += *vl;
+                        let rhs = BigDecimal::from(*vl);
+                        *n = bd_add_decimal32(n, &rhs);
                     }
                     FieldValue::Double(vd) => {
-                        *n += bd_try_from_f64(*vd)?;
+                        let rhs = bd_try_from_f64(*vd)?;
+                        *n = bd_add_decimal32(n, &rhs);
                     }
                     FieldValue::Number(vn) => {
-                        *n += vn;
+                        *n = bd_add_decimal32(n, vn);
                     }
                     _ => {
                         return ia_err!("can't add non-numeric to numeric");
@@ -390,13 +415,9 @@ impl GroupIter {
 
         if aggr_kind == FuncCode::ArrayCollect {
             if let AggrValueEnum::Array(arr) = value {
-                return FieldValue::Array(arr);
-                // TODO
-                //let mut varr = FieldValue::Array(arr);
-                // if in_test_mode {
-                //varr.sort();
-                //}
-                //return varr;
+                let mut collect_array = arr;
+                collect_array.sort_unstable_by(sort_func);
+                return FieldValue::Array(collect_array);
             }
         }
         if aggr_kind == FuncCode::ArrayCollectDistinct {
@@ -543,7 +564,7 @@ impl GroupIter {
             //let mut aggr_tuple_size: i64 = 0;
 
             for i in 0..num_aggr_columns {
-                aggr_tuple.push(AggrValue::new(self.aggr_funcs[i]));
+                aggr_tuple.push(AggrValue::new(self.aggr_funcs[i], self.is_regrouping));
                 if self.count_memory {
                     // TODO aggrTupleSize += aggrTuple[i].sizeof();
                 }
@@ -714,4 +735,8 @@ impl GroupIter {
         }
         Ok(())
     }
+}
+
+fn sort_func(v1: &FieldValue, v2: &FieldValue) -> Ordering {
+    compare_field_values(v1, v2, false)
 }
