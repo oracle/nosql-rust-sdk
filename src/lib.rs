@@ -43,6 +43,67 @@
 //! }
 //! ```
 //!
+//! ## Statistics
+//!
+//! The SDK can collect client-side request statistics using Java-compatible
+//! profile names and JSON field names:
+//!
+//! - [`StatsProfile::None`] disables collection and does not emit stats. This
+//!   is the default.
+//! - [`StatsProfile::Regular`] emits aggregate request counts, success/error
+//!   counts, retry counts, request and response sizes, and basic latency
+//!   summaries.
+//! - [`StatsProfile::More`] adds latency percentile fields to the regular
+//!   request statistics.
+//! - [`StatsProfile::All`] adds query-level aggregation for SQL query requests.
+//!
+//! Configure statistics on the [`HandleBuilder`] before building the handle.
+//! [`StatsPercentileMode::Exact`] is the default and matches the Java SDK's
+//! sample-and-sort percentile behavior; [`StatsPercentileMode::Hdr`] uses a
+//! bounded histogram mode for high-volume clients:
+//!
+//! ```no_run
+//! use oracle_nosql_rust_sdk::{Handle, StatsPercentileMode, StatsProfile, StatsSnapshot};
+//! use std::time::Duration;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let handle = Handle::builder()
+//! #   .endpoint("http://localhost:8080")?
+//! #   .mode(oracle_nosql_rust_sdk::HandleMode::Cloudsim)?
+//!     .from_environment()?
+//!     .stats_profile(StatsProfile::All)?
+//!     .stats_interval(Duration::from_secs(600))?
+//!     .stats_pretty_print(true)?
+//!     .stats_percentile_mode(StatsPercentileMode::Exact)?
+//!     .stats_handler(|stats: &StatsSnapshot| {
+//!         println!("{}", stats.as_json());
+//!     })?
+//!     .build()
+//!     .await?;
+//!
+//! let stats = handle.get_stats_control();
+//! assert!(stats.is_started());
+//! stats.stop();
+//! stats.set_profile(StatsProfile::Regular);
+//! stats.start();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! **Sensitive data warning:** [`StatsProfile::All`] can include raw SQL text
+//! and query plan text in emitted stats. For workloads where SQL literals,
+//! table names, or plans may be sensitive, prefer `stats_enable_log(false)?`
+//! and a [`StatsSnapshot`] handler that redacts before forwarding stats.
+//!
+//! When stats logging is enabled, interval snapshots are emitted at `INFO` with
+//! the `Client stats|` prefix. [`StatsControl::stop`] stops collection, but
+//! non-[`StatsProfile::None`] profiles can still emit empty interval snapshots
+//! like the Java SDK.
+//!
+//! Stats latency is measured from immediately before the HTTP request is sent
+//! until the response body bytes are received. It does not include full NSON
+//! result deserialization or final result object creation.
 //!
 //! ## Prerequisites
 //! - Rust 1.88 or later
@@ -538,6 +599,10 @@ pub(crate) mod seq_aggr_iter;
 pub(crate) mod sfw_iter;
 pub(crate) mod size_iter;
 pub(crate) mod sort_iter;
+pub mod stats;
+pub use crate::stats::{
+    StatsControl, StatsHandler, StatsPercentileMode, StatsProfile, StatsSnapshot,
+};
 pub(crate) mod system_request;
 pub use crate::system_request::{SystemRequest, SystemResult};
 

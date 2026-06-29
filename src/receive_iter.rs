@@ -339,7 +339,7 @@ impl RemoteScanner {
         );
         let mut vr: Vec<MapValue> = Vec::new();
         req_copy
-            .execute_batch_internal(handle, &mut vr, data)
+            .execute_batch_internal(handle, &mut vr, data, false)
             .await?;
         let reached_limit = req_copy.reached_limit || req_copy.continuation_key.is_some();
         debug!(
@@ -658,7 +658,7 @@ impl ReceiveIter {
         debug!("ReceiveIter init_partition_sort executing internal request copy:\n");
         let mut vr: Vec<MapValue> = Vec::new();
         req_copy
-            .execute_batch_internal(handle, &mut vr, &mut self.data)
+            .execute_batch_internal(handle, &mut vr, &mut self.data, false)
             .await?;
         let mut results = VecDeque::from(vr);
         req.consumed_capacity.add(&req_copy.consumed_capacity);

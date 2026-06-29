@@ -87,6 +87,7 @@ impl SystemRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: false,
+            request_name: "System",
             ..Default::default()
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;
@@ -180,6 +181,7 @@ impl SystemStatusRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: true,
+            request_name: "SystemStatus",
             ..Default::default()
         };
         let mut r = h.send_and_receive(w, &mut opts).await?;

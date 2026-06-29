@@ -148,6 +148,7 @@ impl TableUsageRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: true,
+            request_name: "TableUsage",
             compartment_id: self.compartment_id.clone(),
             ..Default::default()
         };

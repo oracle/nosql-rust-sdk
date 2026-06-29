@@ -85,6 +85,7 @@ impl ListTablesRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: true,
+            request_name: "ListTables",
             compartment_id: self.compartment_id.clone(),
             namespace: self.namespace.clone(),
             ..Default::default()

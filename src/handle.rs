@@ -21,6 +21,7 @@ use crate::handle_builder::HandleMode;
 use crate::nson::MapWalker;
 use crate::rate_limiter::RateLimiter;
 use crate::reader::Reader;
+use crate::stats::{QueryStatsMetadata, StatsControl, StatsObservation, StatsRequestMetadata};
 use crate::table_request::{GetTableRequest, TableRequest};
 use crate::types::{Capacity, TableLimits};
 use crate::writer::Writer;
@@ -64,14 +65,25 @@ impl fmt::Debug for Handle {
 }
 
 pub(crate) struct HandleRef {
+    // Reqwest client is shared by every cloned Handle. It owns the HTTP
+    // connection pool and timeout behavior for the SDK process.
     pub(crate) client: reqwest::Client,
+    // Fully normalized service URL, including the SDK data path.
     pub(crate) endpoint: String,
+    // Binary/NSON protocol version used when serializing requests.
     pub(crate) serial_version: i16,
+    // Keep the resolved builder around because auth, namespace, compartment,
+    // stats, and retry behavior are read throughout request execution.
     pub(crate) builder: HandleBuilder,
     rate_limiter_map: Option<RateLimiterMap>,
-    // session doesn't require a tokio Mutex because it's never held across awaits
+    // Runtime stats control is shared with users through Handle::get_stats_control().
+    pub(crate) stats_control: StatsControl,
+    // On-prem/cloud auth can return a session cookie. This is a std::sync::Mutex
+    // because the lock is never held across an await point.
     session: std::sync::Mutex<String>,
+    // Monotonic id used to correlate a request with the matching proxy response.
     request_id: AtomicUsize,
+    // Default request timeout used when the individual request has no override.
     timeout: Duration,
 }
 
@@ -250,7 +262,14 @@ impl Handle {
         HandleBuilder::new()
     }
 
-    // Create the new Handle based on builder configuration
+    /// Returns the runtime statistics control for this handle.
+    pub fn get_stats_control(&self) -> StatsControl {
+        self.inner.stats_control.clone()
+    }
+
+    // Resolve the builder into the shared runtime state used by every request.
+    // This is where auth providers are created, the HTTP client is finalized,
+    // the endpoint is normalized, and stats background logging is started.
     pub(crate) async fn new(b: &HandleBuilder) -> Result<Handle, NoSQLError> {
         if b.auth_type == AuthType::None {
             if b.from_environment {
@@ -289,7 +308,8 @@ impl Handle {
                 cb.build()?
             }
         };
-        // create auth provider if not already created
+        // Instance/resource principal providers need network/environment data
+        // before the handle can send signed cloud requests.
         match builder.auth_type {
             AuthType::Instance => {
                 let ifp = InstancePrincipalAuthProvider::new_with_client(&c).await?;
@@ -320,7 +340,8 @@ impl Handle {
                 return ia_err!("can't determine NoSQL endpoint: call HandleBuilder::endpoint() or HandleBuilder::cloud_region()");
             }
         }
-        // normalize endpoint to "http[s]://{endpoint}/V2/nosql/data"
+        // Normalize endpoint to "http[s]://{endpoint}/V2/nosql/data" so
+        // request code only needs to post to one canonical data endpoint.
         let mut ep = String::from("http");
         if builder.use_https {
             ep.push('s');
@@ -338,21 +359,28 @@ impl Handle {
             } else {
                 None
             };
+        let stats_control = StatsControl::new(&builder);
+        // Install the scheduler even for NONE. It emits no payload while the
+        // profile is NONE, but synchronous runtime profile changes can then
+        // begin interval emission without spawning from those setters.
+        stats_control.start_log_task();
         Ok(Handle {
             inner: Arc::new(HandleRef {
                 client: c,
                 endpoint: ep,
                 serial_version: 4,
-                builder: builder,
+                builder,
                 rate_limiter_map,
-                timeout: timeout.clone(),
+                stats_control,
+                timeout,
                 session: std::sync::Mutex::new("".to_string()),
                 request_id: AtomicUsize::new(1),
             }),
         })
     }
 
-    // geeez, all this to get a stupid usize from an http header....
+    // Response request ids are encoded as HTTP header strings; validate and
+    // parse them before trusting the response payload.
     fn get_usize_header(headers: &HeaderMap, field: &str) -> Result<usize, NoSQLError> {
         let val = headers.get(field);
         if val.is_none() {
@@ -382,15 +410,20 @@ impl Handle {
     ) -> Result<Vec<u8>, NoSQLError> {
         self.inner.builder.refresh_auth_if_needed().await?;
 
+        // The proxy echoes this request id back in the response. It protects the
+        // client from accidentally pairing a response body with the wrong request.
         let request_id = self.inner.request_id.fetch_add(1, Ordering::Relaxed);
         let mut headers = HeaderMap::new();
         headers.insert("x-nosql-request-id", HeaderValue::from(request_id));
 
-        // If there is an oci auth provider, use that to set up required headers
+        // If there is an OCI auth provider, use it below to sign the request.
+        // On-prem auth can add headers immediately, while cloud auth needs the
+        // completed request header set before signing.
         let mut oci_provider: Option<&Box<dyn AuthenticationProvider>> = None;
         let mut requires_explicit_compartment = false;
 
-        // We need to lock the auth config because it may be asynchronously refreshed elsewhere
+        // The auth config can be refreshed after an auth failure, so take the
+        // async lock while selecting the provider and signing headers.
         let pguard = self.inner.builder.auth.lock().await;
         match &pguard.provider {
             AuthProvider::Instance { provider } => {
@@ -451,12 +484,21 @@ impl Handle {
         } else if self.inner.builder.mode == HandleMode::Onprem {
             // headers added above if necessary
         } else if self.inner.builder.mode == HandleMode::Cloudsim {
+            // CloudSim does not validate OCI signatures, but it still expects an
+            // authorization header to follow the proxy protocol.
             headers.insert("Authorization", HeaderValue::from_str("Bearer rust")?);
         }
         // this will unlock the auth mutex
         core::mem::drop(pguard);
 
-        // let send_options.namespace override namespace header
+        // Per-request compartment/namespace options override builder defaults.
+        if !send_options.compartment_id.is_empty() {
+            headers.insert(
+                "x-nosql-compartment-id",
+                HeaderValue::from_str(&send_options.compartment_id)?,
+            );
+        }
+
         if !send_options.namespace.is_empty() {
             headers.insert(
                 "x-nosql-default-ns",
@@ -467,6 +509,10 @@ impl Handle {
         // Set User-Agent
         headers.insert("User-Agent", HeaderValue::from_str(user_agent())?);
 
+        // Stats latency starts at the SDK HTTP boundary. It intentionally
+        // excludes request serialization above and result/NSON deserialization
+        // after `send_and_receive()` returns.
+        let request_start = Instant::now();
         let resp = self
             .inner
             .client
@@ -488,7 +534,7 @@ impl Handle {
             );
         }
 
-        // read request id in return, validate
+        // Read and validate the echoed request id before consuming the payload.
         match Self::get_usize_header(resp.headers(), "x-nosql-request-id") {
             Ok(rid) => {
                 if request_id != rid {
@@ -505,7 +551,7 @@ impl Handle {
         //for (key, value) in resp.headers().iter() {
         //println!("  {:?}: {:?}", key, value);
         //}
-        // get session cookie, if available
+        // Persist a returned session cookie for subsequent requests.
         for i in resp.cookies() {
             if i.name() == "session" {
                 let mut sguard = self.inner.session.lock().unwrap();
@@ -514,6 +560,9 @@ impl Handle {
             }
         }
         let result = resp.bytes().await?;
+        // Stats latency stops after the full response payload is read. The
+        // request-specific result object is created later by each request type.
+        send_options.last_request_latency = request_start.elapsed();
         // TODO: some way to avoid this copy
         Ok(result.to_vec())
     }
@@ -542,18 +591,48 @@ impl Handle {
         apply_rate_limiting: bool,
     ) -> Result<Reader, NoSQLError> {
         send_options.retries = 0;
+        send_options.auth_retries = 0;
+        send_options.last_response_size = 0;
+        send_options.last_request_latency = Duration::ZERO;
+        let request_size = w.size();
+        // Central stats hook for every SDK request: this captures the request
+        // name, sizes, latency, retry counts, auth retry counts, and final
+        // success/error state before the result is returned to the caller.
+        // Latency follows Java's "on the wire" definition by using the final
+        // successful HTTP attempt, excluding retry-loop and rate-limit delay.
         loop {
             match self
                 .send_and_receive_once_internal(&w, send_options, apply_rate_limiting)
                 .await
             {
-                Ok(r) => return Ok(r),
+                Ok(r) => {
+                    let response_size = r.buf.len();
+                    self.inner.stats_control.observe(StatsObservation::success(
+                        send_options.request_metadata(),
+                        request_size,
+                        response_size,
+                        send_options.last_request_latency,
+                        send_options.retries,
+                        send_options.auth_retries,
+                    ));
+                    return Ok(r);
+                }
                 Err(e) => {
                     if e.code == InternalRetry {
                         send_options.retries += 1;
                         //tokio::time::sleep(Duration::from_millis(30)).await;
                         continue;
                     }
+                    let error_code = e.code;
+                    self.inner.stats_control.observe(StatsObservation::error(
+                        send_options.request_metadata(),
+                        request_size,
+                        send_options.last_response_size,
+                        Duration::ZERO,
+                        send_options.retries,
+                        send_options.auth_retries,
+                        error_code,
+                    ));
                     return Err(e);
                 }
             }
@@ -566,13 +645,17 @@ impl Handle {
         send_options: &mut SendOptions,
         apply_rate_limiting: bool,
     ) -> Result<Reader, NoSQLError> {
+        send_options.last_response_size = 0;
         if apply_rate_limiting {
             self.apply_rate_limiting(send_options).await?;
         }
         let bytes = self.post_data(&w.buf, send_options).await?;
+        send_options.last_response_size = bytes.len();
 
         //println!("returned data: len={}", bytes.len());
         let mut r = Reader::new().from_bytes(&bytes);
+        // The proxy encodes service-side errors inside a successful HTTP
+        // response, so inspect the NSON body before returning the Reader.
         let m = MapWalker::check_reader_for_error(&mut r);
         if m.is_ok() {
             return Ok(r);
@@ -609,6 +692,7 @@ impl Handle {
                     )
                 })?;
             if refreshed {
+                send_options.auth_retries += 1;
                 trace!("Refreshed auth provider: retrying");
                 return Err(NoSQLError::new(InternalRetry, ""));
             }
@@ -922,9 +1006,24 @@ impl Handle {
 
 #[derive(Debug, Default)]
 pub(crate) struct SendOptions {
+    // Mutable per-request context passed from request builders through the
+    // transport layer. It keeps protocol options, retry counters, and stats
+    // metadata together without changing each request API signature.
     #[allow(dead_code)]
     pub(crate) retryable: bool,
+    // Number of internal retries that happened before the final outcome.
     pub(crate) retries: u16,
+    // Number of retries specifically caused by refreshed authentication.
+    pub(crate) auth_retries: u16,
+    // Java-compatible request name used in stats JSON, such as "Put" or "Query".
+    pub(crate) request_name: &'static str,
+    // Present only for query HTTP requests that should also update ALL-profile
+    // logical query aggregation.
+    pub(crate) query_stats: Option<QueryStatsMetadata>,
+    // Captured around the last HTTP attempt so stats can report Java-style
+    // payload size and on-the-wire latency.
+    pub(crate) last_response_size: usize,
+    pub(crate) last_request_latency: Duration,
     pub(crate) timeout: Duration,
     pub(crate) compartment_id: String,
     pub(crate) namespace: String,
@@ -989,15 +1088,18 @@ mod tests {
 
     #[test]
     fn handle_ref_debug_redacts_session_cookie() {
+        let builder = HandleBuilder::new();
+        let stats_control = StatsControl::new(&builder);
         let handle_ref = HandleRef {
             client: reqwest::Client::new(),
             endpoint: "https://example.com/V2/nosql/data".to_string(),
             serial_version: 4,
-            builder: HandleBuilder::new(),
+            builder,
+            rate_limiter_map: None,
+            stats_control,
             session: std::sync::Mutex::new("secret-session-cookie".to_string()),
             request_id: AtomicUsize::new(1),
             timeout: Duration::new(30, 0),
-            rate_limiter_map: None,
         };
 
         let debug = format!("{:?}", handle_ref);
@@ -1120,5 +1222,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(compartment, "ocid1.tenancy.oc1..root");
+    }
+}
+
+impl SendOptions {
+    pub(crate) fn request_metadata(&self) -> StatsRequestMetadata {
+        // Convert transport context into the smaller immutable object consumed
+        // by stats aggregation.
+        StatsRequestMetadata::new(
+            self.request_name,
+            self.retryable,
+            !self.compartment_id.is_empty(),
+            !self.namespace.is_empty(),
+        )
+        .with_query(self.query_stats.clone())
     }
 }

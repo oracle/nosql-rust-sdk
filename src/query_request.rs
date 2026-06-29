@@ -14,6 +14,7 @@ use crate::plan_iter::{deserialize_plan_iter, PlanIterKind, PlanIterState};
 use crate::prepared_statement::{PreparedStatement, PreparedStatementBranch};
 use crate::reader::Reader;
 use crate::receive_iter::ReceiveIterData;
+use crate::stats::QueryStatsMetadata;
 use crate::types::NoSQLColumnToFieldValue;
 use crate::types::{Capacity, Consistency, FieldType, FieldValue, MapValue, OpCode, TopologyInfo};
 use crate::writer::Writer;
@@ -141,6 +142,9 @@ pub struct QueryRequest {
 
     // statement specifies a query statement.
     statement: Option<String>,
+
+    get_query_plan: bool,
+    get_query_schema: bool,
 
     // prepared_statement specifies the prepared query statement.
     pub(crate) prepared_statement: PreparedStatement,
@@ -288,6 +292,18 @@ impl QueryRequest {
     /// and can be used in subsequent query calls using [`QueryRequest::new_prepared()`].
     pub fn prepare_only(mut self) -> Self {
         self.prepare_only = true;
+        self
+    }
+
+    /// Specify whether a prepare-only request should return the string query plan.
+    pub fn get_query_plan(mut self, get_query_plan: bool) -> Self {
+        self.get_query_plan = get_query_plan;
+        self
+    }
+
+    /// Specify whether a prepare-only request should return the JSON result schema.
+    pub fn get_query_schema(mut self, get_query_schema: bool) -> Self {
+        self.get_query_schema = get_query_schema;
         self
     }
 
@@ -504,6 +520,47 @@ impl QueryRequest {
         self.prepared_statement.reset()
     }
 
+    fn query_stats_metadata(&self) -> QueryStatsMetadata {
+        let is_prepared = !self.prepared_statement.is_empty();
+        let query = self
+            .statement
+            .clone()
+            .or_else(|| {
+                let sql_text = self.prepared_statement.sql_text();
+                if sql_text.is_empty() {
+                    None
+                } else {
+                    Some(sql_text.to_string())
+                }
+            })
+            .unwrap_or_else(|| "null".to_string());
+
+        QueryStatsMetadata::new(
+            query,
+            !is_prepared,
+            is_prepared && self.prepared_statement.is_simple_query(),
+            is_prepared && self.prepared_statement.does_writes(),
+            if is_prepared {
+                self.prepared_statement.print_driver_plan()
+            } else {
+                None
+            },
+        )
+    }
+
+    fn remember_sql_text_for_stats(&mut self) {
+        if let Some(statement) = &self.statement {
+            self.prepared_statement.set_sql_text(statement);
+        }
+    }
+
+    fn validate_query_input_for_stats(&self) -> Result<(), NoSQLError> {
+        if self.statement.is_none() && self.prepared_statement.is_empty() {
+            return ia_err!("no statement or prepared statement");
+        }
+        Ok(())
+    }
+
     /// Set a named bind variable for execution of a prepared query.
     ///
     /// See [`PreparedStatement`] for an example of using this method.
@@ -568,10 +625,12 @@ impl QueryRequest {
         let mut iter_data = ReceiveIterData::default();
         let mut results: Vec<MapValue> = Vec::new();
         self.reset()?;
+        let mut observe_logical_query = !self.is_internal && !self.prepare_only;
         while self.is_done == false {
             //println!("execute_internal doing next batch");
-            self.execute_batch_internal(h, &mut results, &mut iter_data)
+            self.execute_batch_internal(h, &mut results, &mut iter_data, observe_logical_query)
                 .await?;
+            observe_logical_query = false;
             self.batch_counter += 1;
             if self.batch_counter > 10000 {
                 panic!("Batch_internal infinite loop detected: self={:?}", self);
@@ -606,7 +665,8 @@ impl QueryRequest {
         results: &mut Vec<MapValue>,
     ) -> Result<(), NoSQLError> {
         let mut _data = ReceiveIterData::default();
-        self.execute_batch_internal(handle, results, &mut _data)
+        let observe_logical_query = !self.is_internal && !self.prepare_only;
+        self.execute_batch_internal(handle, results, &mut _data, observe_logical_query)
             .await
     }
 
@@ -624,6 +684,7 @@ impl QueryRequest {
         handle: &Handle,
         results: &mut Vec<MapValue>,
         iter_data: &mut ReceiveIterData,
+        observe_logical_query: bool,
     ) -> Result<(), NoSQLError> {
         trace!(
             "EBI: batch_counter={} num_results={}",
@@ -632,6 +693,16 @@ impl QueryRequest {
         );
 
         self.reached_limit = false;
+        if observe_logical_query {
+            self.validate_query_input_for_stats()?;
+            // Java records the logical query call after local validation but
+            // before the request goes on the wire, so network failures still
+            // count while malformed local requests do not.
+            handle
+                .inner
+                .stats_control
+                .observe_query(self.query_stats_metadata());
+        }
 
         // internal queries do not use plan iterators/etc - they just return plain results.
         if self.is_internal == false {
@@ -693,6 +764,20 @@ impl QueryRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: self.is_retryable(),
+            request_name: if self.prepare_only {
+                "Prepare"
+            } else {
+                "Query"
+            },
+            // A prepare-only request contributes to aggregate Prepare stats,
+            // but Java does not create an ALL-profile query entry for it.
+            // Non-internal Query requests carry metadata that links each HTTP
+            // request back to the logical query entry.
+            query_stats: if self.is_internal || self.prepare_only {
+                None
+            } else {
+                Some(self.query_stats_metadata())
+            },
             compartment_id: self.compartment_id.clone(),
             table_name: self.rate_limit_table_name(),
             does_reads: true,
@@ -708,6 +793,16 @@ impl QueryRequest {
             handle
                 .consume_rate_limited_capacity(&mut opts, &table_name, &batch_consumed)
                 .await;
+        }
+        self.remember_sql_text_for_stats();
+        if !self.is_internal && !self.prepare_only {
+            // Response metadata can fill in query attributes that are only
+            // known after prepare/deserialize, without incrementing the
+            // logical query count again.
+            handle
+                .inner
+                .stats_control
+                .observe_query_metadata(self.query_stats_metadata());
         }
         if self.continuation_key.is_none() {
             trace!("continuation key is None, setting is_done");
@@ -749,6 +844,14 @@ impl QueryRequest {
         //writeMapField(ns, BATCH_COUNTER, rq.getBatchCounter());
 
         ns.write_i32_field(QUERY_VERSION, DRIVER_QUERY_VERSION);
+        if self.prepare_only {
+            if self.get_query_plan {
+                ns.write_bool_field(GET_QUERY_PLAN, true);
+            }
+            if self.get_query_schema {
+                ns.write_bool_field(GET_QUERY_SCHEMA, true);
+            }
+        }
         if self.prepared_statement.is_empty() == false {
             ns.write_bool_field(IS_PREPARED, true);
             ns.write_bool_field(IS_SIMPLE_QUERY, self.prepared_statement.is_simple());
@@ -1126,7 +1229,7 @@ impl QueryRequest {
 }
 
 #[cfg(test)]
-mod tests {
+mod retryability_tests {
     use super::*;
 
     #[test]
@@ -1176,5 +1279,154 @@ mod tests {
         request.registers.push(FieldValue::Uninitialized);
 
         let _ = request.get_result(-1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nson::{GET_QUERY_PLAN, GET_QUERY_SCHEMA, PAYLOAD, QUERY_VERSION, STATEMENT};
+    use crate::{Handle, HandleMode, StatsProfile};
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    fn serialized_payload_fields(request: &QueryRequest) -> (Vec<String>, HashMap<String, bool>) {
+        let mut writer = Writer::new();
+        request
+            .serialize_internal(&mut writer, &Duration::from_secs(30))
+            .unwrap();
+        let mut reader = Reader::new().from_bytes(writer.bytes());
+        let mut root = MapWalker::new(&mut reader).unwrap();
+
+        while root.has_next() {
+            root.next().unwrap();
+            let name = root.current_name().clone();
+            if name != PAYLOAD {
+                root.skip_nson_field().unwrap();
+                continue;
+            }
+
+            let mut payload = MapWalker::new(root.r).unwrap();
+            let mut fields = Vec::new();
+            let mut bools = HashMap::new();
+            while payload.has_next() {
+                payload.next().unwrap();
+                let field = payload.current_name().clone();
+                fields.push(field.clone());
+                match field.as_str() {
+                    GET_QUERY_PLAN | GET_QUERY_SCHEMA => {
+                        bools.insert(field, payload.read_nson_boolean().unwrap());
+                    }
+                    _ => payload.skip_nson_field().unwrap(),
+                }
+            }
+            return (fields, bools);
+        }
+
+        panic!("serialized query request did not contain payload");
+    }
+
+    fn contains_field(fields: &[String], field: &str) -> bool {
+        fields.iter().any(|name| name == field)
+    }
+
+    #[test]
+    fn prepare_only_serializes_query_plan_and_schema_flags_when_requested() {
+        let request = QueryRequest::new("select * from users")
+            .prepare_only()
+            .get_query_plan(true)
+            .get_query_schema(true);
+
+        let (fields, bools) = serialized_payload_fields(&request);
+
+        assert!(contains_field(&fields, QUERY_VERSION));
+        assert!(contains_field(&fields, STATEMENT));
+        assert_eq!(bools.get(GET_QUERY_PLAN), Some(&true));
+        assert_eq!(bools.get(GET_QUERY_SCHEMA), Some(&true));
+
+        let request = QueryRequest::new("select * from users").prepare_only();
+        let (fields, bools) = serialized_payload_fields(&request);
+
+        assert!(!contains_field(&fields, GET_QUERY_PLAN));
+        assert!(!contains_field(&fields, GET_QUERY_SCHEMA));
+        assert!(bools.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_batch_rejects_invalid_request_without_query_stats(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let handle = Handle::builder()
+            .endpoint("http://localhost:8080")?
+            .mode(HandleMode::Cloudsim)?
+            .stats_profile(StatsProfile::All)?
+            .stats_enable_log(false)?
+            .build()
+            .await?;
+
+        let mut request = QueryRequest::default();
+        let mut results = Vec::new();
+
+        // Java validates query input before observeQuery(), so malformed local
+        // requests must not create an ALL-profile logical query entry.
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+
+        let snapshot: Value = serde_json::from_str(
+            handle
+                .get_stats_control()
+                .emit_interval_for_test()
+                .unwrap()
+                .as_json(),
+        )?;
+
+        assert!(snapshot.get("queries").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn execute_batch_counts_each_valid_public_batch_attempt_as_logical_query(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let handle = Handle::builder()
+            .endpoint("http://127.0.0.1:9")?
+            .mode(HandleMode::Cloudsim)?
+            .timeout(Duration::from_millis(50))?
+            .stats_profile(StatsProfile::All)?
+            .stats_enable_log(false)?
+            .build()
+            .await?;
+
+        let mut request = QueryRequest::new("select * from users");
+        let mut results = Vec::new();
+
+        // The request is locally valid, so each public execute_batch() attempt
+        // counts as a logical query even when the local test endpoint is absent.
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+        assert!(request.execute_batch(&handle, &mut results).await.is_err());
+
+        let snapshot: Value = serde_json::from_str(
+            handle
+                .get_stats_control()
+                .emit_interval_for_test()
+                .unwrap()
+                .as_json(),
+        )?;
+
+        let query = query_entry(&snapshot, "select * from users").unwrap();
+        assert_eq!(query["query"], "select * from users");
+        assert_eq!(query["count"], 2);
+        assert_eq!(query["unprepared"], 2);
+        assert_eq!(query["httpRequestCount"], 2);
+        assert_eq!(query["errors"], 2);
+        assert_eq!(query["simple"], false);
+
+        Ok(())
+    }
+
+    fn query_entry<'a>(snapshot: &'a Value, sql: &str) -> Option<&'a Value> {
+        snapshot["queries"]
+            .as_array()?
+            .iter()
+            .find(|query| query["query"] == sql)
     }
 }

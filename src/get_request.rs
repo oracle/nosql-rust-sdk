@@ -158,6 +158,7 @@ impl GetRequest {
         let mut opts = SendOptions {
             timeout: timeout,
             retryable: true,
+            request_name: "Get",
             compartment_id: self.compartment_id.clone(),
             table_name: self.table_name.clone(),
             does_reads: true,
