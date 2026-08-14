@@ -4,7 +4,12 @@
 // Licensed under the Universal Permissive License v 1.0 as shown at
 //  https://oss.oracle.com/licenses/upl/
 //
-use crate::{reader::Reader, writer::Writer};
+use crate::{
+    error::NoSQLErrorCode::BadProtocolMessage,
+    reader::{Reader, MAX_FIELD_VALUE_NESTING_DEPTH},
+    types::FieldType,
+    writer::Writer,
+};
 use std::error::Error;
 use std::result::Result;
 
@@ -141,4 +146,42 @@ fn test_malformed_collection_counts_return_errors() {
 
     let mut reader = Reader::new().from_bytes(&[0, 0, 0, 0, 0, 0, 0, 1]);
     assert!(reader.read_map().is_err());
+}
+
+fn nested_field_value_bytes(nesting_depth: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(nesting_depth * 10 + 1);
+    for depth in 0..nesting_depth {
+        let is_map = depth % 2 != 0;
+        bytes.push(if is_map {
+            FieldType::Map as u8
+        } else {
+            FieldType::Array as u8
+        });
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        if is_map {
+            // A packed zero is an empty map key.
+            bytes.push(127);
+        }
+    }
+    bytes.push(FieldType::Null as u8);
+    bytes
+}
+
+#[test]
+fn test_field_value_nesting_at_limit_is_accepted() {
+    let bytes = nested_field_value_bytes(MAX_FIELD_VALUE_NESTING_DEPTH);
+    let mut reader = Reader::new().from_bytes(&bytes);
+
+    assert!(reader.read_field_value().is_ok());
+}
+
+#[test]
+fn test_field_value_nesting_over_limit_returns_error() {
+    let bytes = nested_field_value_bytes(MAX_FIELD_VALUE_NESTING_DEPTH + 1);
+    let mut reader = Reader::new().from_bytes(&bytes);
+
+    let error = reader.read_field_value().unwrap_err();
+    assert_eq!(error.code, BadProtocolMessage);
+    assert!(error.message.contains("nesting depth exceeds limit"));
 }

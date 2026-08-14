@@ -28,7 +28,7 @@ pub(crate) struct AndOrIter {
 
 impl AndOrIter {
     pub fn new(r: &mut Reader) -> Result<Self, NoSQLError> {
-        let rr = r.read_i32()?;
+        let rr = r.read_query_plan_result_reg()?;
         let sp = r.read_i32()?;
         debug!("\nAndOrIter: result_reg={} state_pos={}\n", rr, sp);
         let code = FuncCode::try_from_u16(r.read_i16()? as u16)?;

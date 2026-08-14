@@ -1152,6 +1152,7 @@ impl QueryRequest {
         //);
         let num_registers = r.read_i32()?;
         Reader::checked_count_with_limit(num_registers, v.len(), "driver plan registers")?;
+        r.validate_query_plan_result_regs(num_registers)?;
         self.prepared_statement.num_registers = num_registers;
         //println!(
         //"   QUERY_PLAN: registers={}",
@@ -1271,14 +1272,43 @@ mod retryability_tests {
         assert!(!QueryRequest::new_prepared(&prepared_mutation).is_retryable());
     }
 
-    #[test]
-    #[should_panic(expected = "INVALID GET REGISTER ACCESS")]
-    fn negative_query_register_is_rejected_before_indexing() {
-        let mut request = QueryRequest::default();
-        request.num_registers = 1;
-        request.registers.push(FieldValue::Uninitialized);
+    fn driver_plan_with_result_reg(result_reg: i32, num_registers: i32) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.write_byte(PlanIterKind::AndOr as u8);
+        writer.write_i32(result_reg);
+        writer.write_i32(0); // unused state position
+        for _ in 0..4 {
+            writer.write_i32(0); // source location
+        }
+        writer.write_i16(0); // FuncCode::OpAnd
+        writer.write_packed_i32(0); // argument iterators
+        writer.write_i32(1); // number of iterators
+        writer.write_i32(num_registers);
+        writer.write_i32(0); // external variables
+        writer.bytes().to_vec()
+    }
 
-        let _ = request.get_result(-1);
+    #[test]
+    fn invalid_query_plan_register_returns_protocol_error() {
+        for result_reg in [-1, 1] {
+            let mut request = QueryRequest::default();
+            let error = request
+                .get_driver_plan_info(&driver_plan_with_result_reg(result_reg, 1))
+                .unwrap_err();
+
+            assert_eq!(error.code, NoSQLErrorCode::BadProtocolMessage);
+            assert!(error.message.contains("invalid query plan result register"));
+        }
+    }
+
+    #[test]
+    fn valid_query_plan_register_is_accepted() {
+        let mut request = QueryRequest::default();
+
+        request
+            .get_driver_plan_info(&driver_plan_with_result_reg(0, 1))
+            .unwrap();
+        assert_eq!(request.prepared_statement.num_registers, 1);
     }
 }
 

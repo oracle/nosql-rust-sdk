@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/).
 ### Added
 - Latest OCI region codes
 
+### Fixed
+- Server-controlled query plan triggers panic! abort
+- Unbounded recursion in read_field_value can result in stack overflow
+
 ## 0.1.4 06/22/2026
 
 ### Changed
