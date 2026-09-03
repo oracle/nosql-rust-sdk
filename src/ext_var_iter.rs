@@ -57,7 +57,7 @@ impl Clone for ExtVarIterData {
 impl ExtVarIter {
     pub fn new(r: &mut Reader) -> Result<Self, NoSQLError> {
         // state_pos is now ignored, in the rust driver implementation
-        let rr = r.read_i32()?; // result_reg
+        let rr = r.read_query_plan_result_reg()?; // result_reg
         let sp = r.read_i32()?; // state_pos
         trace!("\nExtVarIter: result_reg={} state_pos={}\n", rr, sp);
         let v = ExtVarIter {

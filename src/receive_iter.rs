@@ -405,7 +405,7 @@ impl RemoteScanner {
 impl ReceiveIter {
     pub fn new(r: &mut Reader) -> Result<Self, NoSQLError> {
         // state_pos is now ignored, in the rust driver implementation
-        let rr = r.read_i32()?; // result_reg
+        let rr = r.read_query_plan_result_reg()?; // result_reg
         let sp = r.read_i32()?; // state_pos
         debug!("\n . ReceiveIter: result_reg={} state_pos={}\n", rr, sp);
         let mut iter = ReceiveIter {

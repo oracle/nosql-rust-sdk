@@ -26,7 +26,7 @@ pub(crate) struct ArrayConstrIter {
 
 impl ArrayConstrIter {
     pub fn new(r: &mut Reader) -> Result<Self, NoSQLError> {
-        let rr = r.read_i32()?;
+        let rr = r.read_query_plan_result_reg()?;
         let sp = r.read_i32()?;
         debug!("\nArrayConstrIter: result_reg={} state_pos={}\n", rr, sp);
         Ok(ArrayConstrIter {

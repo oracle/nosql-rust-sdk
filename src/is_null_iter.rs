@@ -28,7 +28,7 @@ pub(crate) struct IsNullIter {
 
 impl IsNullIter {
     pub fn new(r: &mut Reader) -> Result<Self, NoSQLError> {
-        let rr = r.read_i32()?;
+        let rr = r.read_query_plan_result_reg()?;
         let sp = r.read_i32()?;
         debug!("\nIsNullIter: result_reg={} state_pos={}\n", rr, sp);
         Ok(IsNullIter {

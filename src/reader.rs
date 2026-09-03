@@ -19,6 +19,10 @@ use crate::types::FieldType;
 use crate::types::FieldValue;
 use crate::types::MapValue;
 
+// Bound recursive array/map decoding so malformed responses cannot exhaust the
+// thread stack. Normal SDK payloads have far shallower nesting.
+pub(crate) const MAX_FIELD_VALUE_NESTING_DEPTH: usize = 100;
+
 // Reader reads byte sequences from the underlying io.Reader and decodes the
 // bytes to construct in-memory representations according to the Binary Protocol
 // which defines the data exchange format between the Oracle NoSQL Database
@@ -27,6 +31,9 @@ pub struct Reader {
     // The underlying byte buffer.
     pub buf: Vec<u8>,
     pub offset: usize,
+    // Collected while decoding a driver query plan, then checked once the
+    // plan's register count (which follows the serialized iterator tree) is read.
+    query_plan_result_registers: Vec<i32>,
 }
 
 impl Reader {
@@ -34,12 +41,14 @@ impl Reader {
         Reader {
             buf: Vec::with_capacity(256),
             offset: 0,
+            query_plan_result_registers: Vec::new(),
         }
     }
 
     pub fn from_bytes(mut self, val: &[u8]) -> Self {
         self.buf.clear();
         self.buf.extend_from_slice(val);
+        self.query_plan_result_registers.clear();
         self
     }
 
@@ -115,6 +124,33 @@ impl Reader {
             )
             .as_str(),
         ))
+    }
+
+    pub(crate) fn read_query_plan_result_reg(&mut self) -> Result<i32, NoSQLError> {
+        let result_reg = self.read_i32()?;
+        self.query_plan_result_registers.push(result_reg);
+        Ok(result_reg)
+    }
+
+    pub(crate) fn validate_query_plan_result_regs(
+        &self,
+        num_registers: i32,
+    ) -> Result<(), NoSQLError> {
+        if let Some(result_reg) = self
+            .query_plan_result_registers
+            .iter()
+            .find(|result_reg| **result_reg < 0 || **result_reg >= num_registers)
+        {
+            return Err(NoSQLError::new(
+                BadProtocolMessage,
+                format!(
+                    "invalid query plan result register {}; number of registers is {}",
+                    result_reg, num_registers
+                )
+                .as_str(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn read_float64(&mut self) -> result::Result<f64, NoSQLError> {
@@ -264,6 +300,13 @@ impl Reader {
     }
 
     pub(crate) fn read_field_value(&mut self) -> Result<FieldValue, NoSQLError> {
+        self.read_field_value_with_depth(0)
+    }
+
+    fn read_field_value_with_depth(
+        &mut self,
+        nesting_depth: usize,
+    ) -> Result<FieldValue, NoSQLError> {
         // read field type
         let u = self.read_byte()?;
         //println!(" read_byte={}", u);
@@ -291,11 +334,11 @@ impl Reader {
                 return Ok(FieldValue::String(str));
             }
             FieldType::Array => {
-                let arr = self.read_array()?;
+                let arr = self.read_array_with_depth(self.next_nesting_depth(nesting_depth)?)?;
                 return Ok(FieldValue::Array(arr));
             }
             FieldType::Map => {
-                let map = self.read_map()?;
+                let map = self.read_map_with_depth(self.next_nesting_depth(nesting_depth)?)?;
                 return Ok(FieldValue::Map(map));
             }
             FieldType::Boolean => {
@@ -334,7 +377,28 @@ impl Reader {
         }
     }
 
+    fn next_nesting_depth(&self, nesting_depth: usize) -> Result<usize, NoSQLError> {
+        if nesting_depth >= MAX_FIELD_VALUE_NESTING_DEPTH {
+            return Err(NoSQLError::new(
+                BadProtocolMessage,
+                format!(
+                    "field value nesting depth exceeds limit of {}",
+                    MAX_FIELD_VALUE_NESTING_DEPTH
+                )
+                .as_str(),
+            ));
+        }
+        Ok(nesting_depth + 1)
+    }
+
     pub fn read_array(&mut self) -> Result<Vec<FieldValue>, NoSQLError> {
+        self.read_array_with_depth(1)
+    }
+
+    fn read_array_with_depth(
+        &mut self,
+        nesting_depth: usize,
+    ) -> Result<Vec<FieldValue>, NoSQLError> {
         // number of bytes consumed by the array.
         let _num_bytes = self.read_i32()?;
         // number of items in the array
@@ -345,7 +409,7 @@ impl Reader {
         let mut arr = Vec::<FieldValue>::new();
         Self::try_reserve_vec(&mut arr, num_items, "array message")?;
         for _i in 0..num_items {
-            let v = self.read_field_value()?;
+            let v = self.read_field_value_with_depth(nesting_depth)?;
             //println!(" array element {}: {:?}", i, v);
             arr.push(v);
             //arr.push(self.read_field_value()?);
@@ -397,6 +461,10 @@ impl Reader {
     }
 
     pub fn read_map(&mut self) -> Result<MapValue, NoSQLError> {
+        self.read_map_with_depth(1)
+    }
+
+    fn read_map_with_depth(&mut self, nesting_depth: usize) -> Result<MapValue, NoSQLError> {
         // number of bytes consumed by the map.
         let _num_bytes = self.read_i32()?;
         // number of items in the map
@@ -408,7 +476,7 @@ impl Reader {
         for _i in 0..num_items {
             let key = self.read_string()?;
             //println!("Reading field '{}'", key);
-            let val = self.read_field_value()?;
+            let val = self.read_field_value_with_depth(nesting_depth)?;
             //println!("read key '{}' with value {:?}", key, val);
             mv.put_field_value(&key, val);
         }

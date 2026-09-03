@@ -8,12 +8,24 @@ use oracle_nosql_rust_sdk::types::{Consistency, MapValue, TableLimits, TableStat
 use oracle_nosql_rust_sdk::{
     GetRequest, GetTableRequest, Handle, HandleMode, PutRequest, TableRequest,
 };
+use std::env;
 use std::error::Error;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CLOUDSIM_ENDPOINT: &str = "http://127.0.0.1:8080";
 const LIMIT_UNITS_PER_SECOND: i32 = 100;
 const RATE_TEST_OPERATIONS: i32 = 250;
+
+fn skip_for_onprem_mode() -> bool {
+    env::var("ORACLE_NOSQL_AUTH")
+        .map(|mode| {
+            matches!(
+                mode.trim().to_ascii_lowercase().as_str(),
+                "onprem" | "sonprem"
+            )
+        })
+        .unwrap_or(false)
+}
 
 async fn cloudsim_handle(rate_limiting_enabled: bool) -> Result<Handle, Box<dyn Error>> {
     Ok(Handle::builder()
@@ -126,6 +138,11 @@ fn assert_rate_close_to_limit(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rate_limited_puts_are_close_to_table_write_limit() -> Result<(), Box<dyn Error>> {
+    if skip_for_onprem_mode() {
+        println!("skipping rate limiter test in onprem/sonprem mode");
+        return Ok(());
+    }
+
     let setup_handle = cloudsim_handle(false).await?;
     let table_name = unique_table_name("ratelimit_put");
 
@@ -160,6 +177,11 @@ async fn rate_limited_puts_are_close_to_table_write_limit() -> Result<(), Box<dy
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rate_limited_gets_are_close_to_table_read_limit() -> Result<(), Box<dyn Error>> {
+    if skip_for_onprem_mode() {
+        println!("skipping rate limiter test in onprem/sonprem mode");
+        return Ok(());
+    }
+
     let setup_handle = cloudsim_handle(false).await?;
     let table_name = unique_table_name("ratelimit_get");
 
