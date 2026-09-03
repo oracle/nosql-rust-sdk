@@ -276,6 +276,19 @@ pub enum NoSQLErrorCode {
     /// protocol version (and accompanying logic) and try again.
     UnsupportedProtocol = 24,
 
+    /// TableNotReady error indicates the table is still being created or
+    /// updated and is not ready for use.
+    TableNotReady = 26,
+
+    /// UnsupportedQueryVersion error indicates the server does not support the
+    /// query protocol version used by the SDK.
+    UnsupportedQueryVersion = 27,
+
+    /// RecompileQuery error indicates that a prepared query is no longer valid,
+    /// typically because a referenced table or index changed. The query must be
+    /// prepared again before it can be submitted.
+    RecompileQuery = 28,
+
     /// ReadLimitExceeded error represents that the provisioned read throughput
     /// has been exceeded.
     ///
@@ -375,4 +388,24 @@ pub enum NoSQLErrorCode {
 
     /// InternalRetry is used internally for retry logic.
     InternalRetry = 1001,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_current_protocol_query_and_table_result_codes() {
+        let cases = [
+            (26, NoSQLErrorCode::TableNotReady),
+            (27, NoSQLErrorCode::UnsupportedQueryVersion),
+            (28, NoSQLErrorCode::RecompileQuery),
+        ];
+
+        for (result_code, expected) in cases {
+            let error = NoSQLError::from_int(result_code, "server message");
+            assert_eq!(error.code, expected);
+            assert_eq!(error.message, "server message");
+        }
+    }
 }
