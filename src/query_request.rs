@@ -24,8 +24,6 @@ use std::result::Result;
 use std::time::Duration;
 use tracing::trace;
 
-const DRIVER_QUERY_VERSION: i32 = 6;
-
 fn is_retryable_query_statement(statement: &str) -> bool {
     matches!(
         first_sql_operation_keyword(statement).as_deref(),
@@ -756,10 +754,7 @@ impl QueryRequest {
             //self.batch_counter += 1;
         }
 
-        let mut w: Writer = Writer::new();
-        w.write_i16(handle.inner.serial_version);
         let timeout = handle.get_timeout(&self.timeout);
-        self.serialize_internal(&mut w, &timeout)?;
         let consumed_before = self.consumed_capacity;
         let mut opts = SendOptions {
             timeout: timeout,
@@ -784,9 +779,24 @@ impl QueryRequest {
             does_writes: self.does_writes_for_rate_limiting(),
             ..Default::default()
         };
-        let mut r = handle.send_and_receive(w, &mut opts).await?;
+        let (mut r, query_version) = loop {
+            let query_version = handle.query_version();
+            let mut w: Writer = Writer::new();
+            w.write_i16(handle.inner.serial_version);
+            self.serialize_internal(&mut w, &timeout, query_version)?;
+            match handle.send_and_receive(w, &mut opts).await {
+                Ok(r) => break (r, query_version),
+                Err(e) if is_unsupported_query_version(&e) => {
+                    if handle.decrement_query_version(query_version) {
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        };
         self.continuation_key = None;
-        self.nson_deserialize(&mut r, results, iter_data)?;
+        self.nson_deserialize(&mut r, results, iter_data, query_version)?;
         let batch_consumed = self.consumed_capacity.delta_since(&consumed_before);
         let table_name = self.rate_limit_table_name();
         if !table_name.is_empty() {
@@ -811,7 +821,12 @@ impl QueryRequest {
         Ok(())
     }
 
-    fn serialize_internal(&self, w: &mut Writer, timeout: &Duration) -> Result<(), NoSQLError> {
+    fn serialize_internal(
+        &self,
+        w: &mut Writer,
+        timeout: &Duration,
+        query_version: i32,
+    ) -> Result<(), NoSQLError> {
         let mut ns = NsonSerializer::start_request(w);
         ns.start_header();
         if self.prepare_only {
@@ -843,7 +858,7 @@ impl QueryRequest {
         //writeMapField(ns, TRACE_AT_LOG_FILES, rq.getLogFileTracing());
         //writeMapField(ns, BATCH_COUNTER, rq.getBatchCounter());
 
-        ns.write_i32_field(QUERY_VERSION, DRIVER_QUERY_VERSION);
+        ns.write_i32_field(QUERY_VERSION, query_version);
         if self.prepare_only {
             if self.get_query_plan {
                 ns.write_bool_field(GET_QUERY_PLAN, true);
@@ -943,6 +958,7 @@ impl QueryRequest {
         r: &mut Reader,
         results: &mut Vec<MapValue>,
         iter_data: &mut ReceiveIterData,
+        query_version: i32,
     ) -> Result<(), NoSQLError> {
         // TODO short serialVersion
         // TODO short queryVersion
@@ -1004,7 +1020,7 @@ impl QueryRequest {
                         return ia_err!("got driver plan in result for already prepared query");
                     }
                     let v = walker.read_nson_binary()?;
-                    self.get_driver_plan_info(&v)?;
+                    self.get_driver_plan_info(&v, query_version)?;
                 }
                 REACHED_LIMIT => {
                     self.reached_limit = walker.read_nson_boolean()?;
@@ -1130,11 +1146,12 @@ impl QueryRequest {
         Ok(result)
     }
 
-    fn get_driver_plan_info(&mut self, v: &Vec<u8>) -> Result<(), NoSQLError> {
+    fn get_driver_plan_info(&mut self, v: &Vec<u8>, query_version: i32) -> Result<(), NoSQLError> {
         if v.len() == 0 {
             return Ok(());
         }
         let mut r = Reader::new().from_bytes(v);
+        r.set_query_version(query_version);
         self.prepared_statement.driver_query_plan = deserialize_plan_iter(&mut r)?;
         trace!(
             "driver query plan:\n{:?}",
@@ -1229,9 +1246,31 @@ impl QueryRequest {
     }
 }
 
+fn is_unsupported_query_version(error: &NoSQLError) -> bool {
+    error.code == NoSQLErrorCode::UnsupportedQueryVersion
+        || (error.code == NoSQLErrorCode::BadProtocolMessage
+            && error.message.contains("Invalid query version"))
+}
+
 #[cfg(test)]
 mod retryability_tests {
     use super::*;
+
+    #[test]
+    fn recognizes_query_version_negotiation_errors() {
+        assert!(is_unsupported_query_version(&NoSQLError::new(
+            NoSQLErrorCode::UnsupportedQueryVersion,
+            "Unsupported query version 6",
+        )));
+        assert!(is_unsupported_query_version(&NoSQLError::new(
+            NoSQLErrorCode::BadProtocolMessage,
+            "Invalid query version 6",
+        )));
+        assert!(!is_unsupported_query_version(&NoSQLError::new(
+            NoSQLErrorCode::BadProtocolMessage,
+            "malformed query",
+        )));
+    }
 
     #[test]
     fn query_retryability_classifies_statement_text() {
@@ -1293,7 +1332,7 @@ mod retryability_tests {
         for result_reg in [-1, 1] {
             let mut request = QueryRequest::default();
             let error = request
-                .get_driver_plan_info(&driver_plan_with_result_reg(result_reg, 1))
+                .get_driver_plan_info(&driver_plan_with_result_reg(result_reg, 1), 6)
                 .unwrap_err();
 
             assert_eq!(error.code, NoSQLErrorCode::BadProtocolMessage);
@@ -1306,7 +1345,7 @@ mod retryability_tests {
         let mut request = QueryRequest::default();
 
         request
-            .get_driver_plan_info(&driver_plan_with_result_reg(0, 1))
+            .get_driver_plan_info(&driver_plan_with_result_reg(0, 1), 6)
             .unwrap();
         assert_eq!(request.prepared_statement.num_registers, 1);
     }
@@ -1320,10 +1359,13 @@ mod tests {
     use serde_json::Value;
     use std::collections::HashMap;
 
-    fn serialized_payload_fields(request: &QueryRequest) -> (Vec<String>, HashMap<String, bool>) {
+    fn serialized_payload_fields(
+        request: &QueryRequest,
+        query_version: i32,
+    ) -> (Vec<String>, HashMap<String, bool>, HashMap<String, i32>) {
         let mut writer = Writer::new();
         request
-            .serialize_internal(&mut writer, &Duration::from_secs(30))
+            .serialize_internal(&mut writer, &Duration::from_secs(30), query_version)
             .unwrap();
         let mut reader = Reader::new().from_bytes(writer.bytes());
         let mut root = MapWalker::new(&mut reader).unwrap();
@@ -1339,6 +1381,7 @@ mod tests {
             let mut payload = MapWalker::new(root.r).unwrap();
             let mut fields = Vec::new();
             let mut bools = HashMap::new();
+            let mut ints = HashMap::new();
             while payload.has_next() {
                 payload.next().unwrap();
                 let field = payload.current_name().clone();
@@ -1347,10 +1390,13 @@ mod tests {
                     GET_QUERY_PLAN | GET_QUERY_SCHEMA => {
                         bools.insert(field, payload.read_nson_boolean().unwrap());
                     }
+                    QUERY_VERSION => {
+                        ints.insert(field, payload.read_nson_i32().unwrap());
+                    }
                     _ => payload.skip_nson_field().unwrap(),
                 }
             }
-            return (fields, bools);
+            return (fields, bools, ints);
         }
 
         panic!("serialized query request did not contain payload");
@@ -1367,19 +1413,30 @@ mod tests {
             .get_query_plan(true)
             .get_query_schema(true);
 
-        let (fields, bools) = serialized_payload_fields(&request);
+        let (fields, bools, ints) = serialized_payload_fields(&request, 6);
 
         assert!(contains_field(&fields, QUERY_VERSION));
         assert!(contains_field(&fields, STATEMENT));
         assert_eq!(bools.get(GET_QUERY_PLAN), Some(&true));
         assert_eq!(bools.get(GET_QUERY_SCHEMA), Some(&true));
+        assert_eq!(ints.get(QUERY_VERSION), Some(&6));
 
         let request = QueryRequest::new("select * from users").prepare_only();
-        let (fields, bools) = serialized_payload_fields(&request);
+        let (fields, bools, _) = serialized_payload_fields(&request, 6);
 
         assert!(!contains_field(&fields, GET_QUERY_PLAN));
         assert!(!contains_field(&fields, GET_QUERY_SCHEMA));
         assert!(bools.is_empty());
+    }
+
+    #[test]
+    fn query_request_serializes_each_supported_query_version() {
+        let request = QueryRequest::new("select * from users");
+
+        for query_version in [4, 5, 6] {
+            let (_, _, ints) = serialized_payload_fields(&request, query_version);
+            assert_eq!(ints.get(QUERY_VERSION), Some(&query_version));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

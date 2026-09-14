@@ -68,8 +68,65 @@ impl GroupIter {
         gi.is_distinct = r.read_bool()?;
         gi.remove_produced_result = r.read_bool()?;
         gi.count_memory = r.read_bool()?;
-        gi.is_regrouping = r.read_bool()?;
+        // QUERY_V6 added this flag. V4/V5 plans omit it and use the legacy
+        // regrouping behavior.
+        gi.is_regrouping = if r.query_version() >= 6 {
+            r.read_bool()?
+        } else {
+            true
+        };
         Ok(gi)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writer::Writer;
+
+    fn serialized_group_iter(include_v6_flag: bool) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.write_i32(0); // result register
+        writer.write_i32(0); // state position
+        for _ in 0..4 {
+            writer.write_i32(0); // source location
+        }
+        writer.write_byte(255); // no input iterator
+        writer.write_i32(0); // group-by columns
+        writer.write_packed_i32(0); // column names
+        writer.write_bool(false); // distinct
+        writer.write_bool(false); // remove produced result
+        writer.write_bool(false); // count memory
+        if include_v6_flag {
+            writer.write_bool(false); // is regrouping
+        }
+        writer.bytes().to_vec()
+    }
+
+    #[test]
+    fn v4_and_v5_group_plans_use_legacy_regrouping_layout() {
+        for query_version in [4, 5] {
+            let bytes = serialized_group_iter(false);
+            let mut reader = Reader::new().from_bytes(&bytes);
+            reader.set_query_version(query_version);
+
+            let iter = GroupIter::new(&mut reader).unwrap();
+
+            assert!(iter.is_regrouping);
+            assert_eq!(reader.offset, bytes.len());
+        }
+    }
+
+    #[test]
+    fn v6_group_plan_reads_regrouping_flag() {
+        let bytes = serialized_group_iter(true);
+        let mut reader = Reader::new().from_bytes(&bytes);
+        reader.set_query_version(6);
+
+        let iter = GroupIter::new(&mut reader).unwrap();
+
+        assert!(!iter.is_regrouping);
+        assert_eq!(reader.offset, bytes.len());
     }
 }
 

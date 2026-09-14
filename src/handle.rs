@@ -29,8 +29,8 @@ use crate::writer::Writer;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::result::Result;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI32, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace};
@@ -72,6 +72,10 @@ pub(crate) struct HandleRef {
     pub(crate) endpoint: String,
     // Binary/NSON protocol version used when serializing requests.
     pub(crate) serial_version: i16,
+    // Query protocol version is negotiated independently of the serial
+    // version. It is shared by cloned handles so one downgrade applies to all
+    // subsequent query and prepare requests.
+    query_version: AtomicI32,
     // Keep the resolved builder around because auth, namespace, compartment,
     // stats, and retry behavior are read throughout request execution.
     pub(crate) builder: HandleBuilder,
@@ -92,6 +96,7 @@ impl fmt::Debug for HandleRef {
         f.debug_struct("HandleRef")
             .field("endpoint", &self.endpoint)
             .field("serial_version", &self.serial_version)
+            .field("query_version", &self.query_version.load(Ordering::Relaxed))
             .field("builder", &self.builder)
             .field("session", &"[redacted]")
             .field("request_id", &self.request_id)
@@ -369,6 +374,7 @@ impl Handle {
                 client: c,
                 endpoint: ep,
                 serial_version: 4,
+                query_version: AtomicI32::new(6),
                 builder,
                 rate_limiter_map,
                 stats_control,
@@ -574,6 +580,35 @@ impl Handle {
         send_options: &mut SendOptions,
     ) -> Result<Reader, NoSQLError> {
         self.send_and_receive_internal(w, send_options, true).await
+    }
+
+    pub(crate) fn query_version(&self) -> i32 {
+        self.inner.query_version.load(Ordering::Relaxed)
+    }
+
+    /// Decrease the shared query version if `version_used` is still current.
+    /// If another request already decreased it, the caller should retry using
+    /// that newer shared value. NSON query protocol v4 is the oldest version
+    /// supported by this SDK.
+    pub(crate) fn decrement_query_version(&self, version_used: i32) -> bool {
+        loop {
+            let current = self.inner.query_version.load(Ordering::Relaxed);
+            if current != version_used {
+                return true;
+            }
+            if current <= 4 {
+                return false;
+            }
+            if self
+                .inner
+                .query_version
+                .compare_exchange(current, current - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                trace!("decremented query version to {}", current - 1);
+                return true;
+            }
+        }
     }
 
     async fn send_and_receive_without_rate_limiting(
@@ -1094,6 +1129,7 @@ mod tests {
             client: reqwest::Client::new(),
             endpoint: "https://example.com/V2/nosql/data".to_string(),
             serial_version: 4,
+            query_version: AtomicI32::new(6),
             builder,
             rate_limiter_map: None,
             stats_control,
@@ -1106,6 +1142,39 @@ mod tests {
 
         assert!(!debug.contains("secret-session-cookie"));
         assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn query_version_decrements_to_v4_and_stops() {
+        let builder = HandleBuilder::new();
+        let stats_control = StatsControl::new(&builder);
+        let handle = Handle {
+            inner: Arc::new(HandleRef {
+                client: reqwest::Client::new(),
+                endpoint: "https://example.com/V2/nosql/data".to_string(),
+                serial_version: 4,
+                query_version: AtomicI32::new(6),
+                builder,
+                rate_limiter_map: None,
+                stats_control,
+                session: std::sync::Mutex::new(String::new()),
+                request_id: AtomicUsize::new(1),
+                timeout: Duration::new(30, 0),
+            }),
+        };
+
+        assert_eq!(handle.query_version(), 6);
+        assert!(handle.decrement_query_version(6));
+        assert_eq!(handle.query_version(), 5);
+        assert!(handle.decrement_query_version(5));
+        assert_eq!(handle.query_version(), 4);
+        assert!(!handle.decrement_query_version(4));
+        assert_eq!(handle.query_version(), 4);
+
+        // A concurrent caller that used an older cached version should retry
+        // with the already-negotiated shared value, not decrement it again.
+        assert!(handle.decrement_query_version(6));
+        assert_eq!(handle.query_version(), 4);
     }
 
     #[test]

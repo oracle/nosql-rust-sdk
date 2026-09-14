@@ -34,6 +34,10 @@ pub struct Reader {
     // Collected while decoding a driver query plan, then checked once the
     // plan's register count (which follows the serialized iterator tree) is read.
     query_plan_result_registers: Vec<i32>,
+    // Query plan v6 added fields to the serialized iterator tree. Readers are
+    // otherwise version-independent, so this defaults to the current version
+    // and is overridden while decoding a server-provided driver plan.
+    query_version: i32,
 }
 
 impl Reader {
@@ -42,7 +46,16 @@ impl Reader {
             buf: Vec::with_capacity(256),
             offset: 0,
             query_plan_result_registers: Vec::new(),
+            query_version: 6,
         }
+    }
+
+    pub(crate) fn set_query_version(&mut self, query_version: i32) {
+        self.query_version = query_version;
+    }
+
+    pub(crate) fn query_version(&self) -> i32 {
+        self.query_version
     }
 
     pub fn from_bytes(mut self, val: &[u8]) -> Self {
@@ -391,6 +404,7 @@ impl Reader {
         Ok(nesting_depth + 1)
     }
 
+    #[allow(dead_code)]
     pub fn read_array(&mut self) -> Result<Vec<FieldValue>, NoSQLError> {
         self.read_array_with_depth(1)
     }
