@@ -22,6 +22,7 @@ use crate::types::MapValue;
 // Bound recursive array/map decoding so malformed responses cannot exhaust the
 // thread stack. Normal SDK payloads have far shallower nesting.
 pub(crate) const MAX_FIELD_VALUE_NESTING_DEPTH: usize = 100;
+const QUERY_VERSION_6: i32 = 6;
 
 // Reader reads byte sequences from the underlying io.Reader and decodes the
 // bytes to construct in-memory representations according to the Binary Protocol
@@ -46,7 +47,7 @@ impl Reader {
             buf: Vec::with_capacity(256),
             offset: 0,
             query_plan_result_registers: Vec::new(),
-            query_version: 6,
+            query_version: QUERY_VERSION_6,
         }
     }
 
