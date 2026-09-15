@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/).
 ### Fixed
 - Server-controlled query plan triggers panic! abort
 - Unbounded recursion in read_field_value can result in stack overflow
+- Re-added support for older servers using query versions 4 and 5
 
 ## 0.1.4 06/22/2026
 
