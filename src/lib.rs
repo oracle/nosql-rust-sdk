@@ -152,6 +152,7 @@
 //! There are several ways of specifying the cloud service credentials to use, including:
 //! - Instance Principals
 //! - Resource Principals
+//! - OKE Workload Identity
 //! - User Config File
 //!
 //! #### Using Instance Principal Credentials
@@ -167,6 +168,43 @@
 //! Resource Principal is an IAM service feature that enables the resources to be authorized actors (or principals) to perform actions on service resources. You may use Resource Principal when calling Oracle NoSQL Database Cloud Service from other Oracle Cloud service resource such as [Functions](https://docs.cloud.oracle.com/en-us/iaas/Content/Functions/Concepts/functionsoverview.htm). See [Accessing Other Oracle Cloud Infrastructure Resources from Running Functions](https://docs.cloud.oracle.com/en-us/iaas/Content/Functions/Tasks/functionsaccessingociresources.htm) for how to set up Resource Principal.
 //!
 //! To configure NoSQL in this mode, use the [`HandleBuilder::cloud_auth_from_resource()`] method on the config struct.
+//!
+//! #### Using OKE Workload Identity
+//!
+//! Applications running in Oracle Container Engine for Kubernetes (OKE) can use
+//! their Kubernetes service account to authenticate to the NoSQL Cloud Service.
+//! Configure the workload's OCI access policies, then create a handle:
+//!
+//! ```no_run
+//! # use oracle_nosql_rust_sdk::Handle;
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let handle = Handle::builder()
+//!     .cloud_auth_from_oke()?
+//!     .compartment_id("ocid1.compartment.oc1..example")?
+//!     .build().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The default service account token is read from
+//! `/var/run/secrets/kubernetes.io/serviceaccount/token`. Use
+//! [`HandleBuilder::cloud_auth_from_oke_with_token_file()`] for a custom token file,
+//! or [`HandleBuilder::cloud_auth_from_oke_with_token()`] for an inline token.
+//! Session tokens refresh automatically; file-based service account tokens are
+//! re-read on refresh to pick up Kubernetes token rotation. An expired inline
+//! token requires rebuilding the handle with a fresh token.
+//!
+//! `KUBERNETES_SERVICE_HOST` identifies the token exchange endpoint, which uses
+//! HTTPS on port 12250. Its certificate must match that host and chain to the CA
+//! in `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`, or the file selected
+//! by `OCI_KUBERNETES_SERVICE_ACCOUNT_CERT_PATH`. This exchange uses a dedicated
+//! client with certificate and hostname verification always enabled.
+//!
+//! The region comes from [`HandleBuilder::cloud_region()`], `OCI_REGION_METADATA`,
+//! or instance metadata, in that order. A default or per-request compartment is
+//! required. For environment-based configuration, set `ORACLE_NOSQL_AUTH=oke`
+//! and optionally `ORACLE_NOSQL_AUTH_FILE` to a custom service account token file,
+//! then use [`HandleBuilder::from_environment()`].
 //!
 //! #### Using User Config File to Specify OCI Credentials
 //!

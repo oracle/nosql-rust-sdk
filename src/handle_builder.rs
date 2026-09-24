@@ -18,6 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::auth_common::authentication_provider::AuthenticationProvider;
 use crate::auth_common::config_file_authentication_provider::ConfigFileAuthenticationProvider;
 use crate::auth_common::instance_principal_auth_provider::InstancePrincipalAuthProvider;
+use crate::auth_common::oke_workload_identity_auth_provider::{
+    OkeTokenSource, OkeWorkloadIdentityAuthProvider,
+};
 use crate::auth_common::resource_principal_auth_provider::ResourcePrincipalAuthProvider;
 use crate::error::{ia_err, NoSQLError};
 use crate::handle::Handle;
@@ -53,6 +56,7 @@ pub struct HandleBuilder {
     pub(crate) client: Option<Client>,
     pub(crate) accept_invalid_certs: bool,
     pub(crate) auth_type: AuthType,
+    pub(crate) oke_token_source: OkeTokenSource,
     // auth uses a tokio Mutex because we occasionally hold a lock across awaits
     pub(crate) auth: Arc<tokio::sync::Mutex<AuthConfig>>,
     // For doc testing
@@ -113,6 +117,9 @@ pub(crate) enum AuthProvider {
         provider: Box<dyn AuthenticationProvider>,
         // TODO: is refreshable? expiration, etc
     },
+    Oke {
+        provider: Box<OkeWorkloadIdentityAuthProvider>,
+    },
     External {
         provider: Box<dyn AuthenticationProvider>,
     },
@@ -139,6 +146,10 @@ impl fmt::Debug for AuthProvider {
                 .debug_struct("Resource")
                 .field("provider", &"[redacted]")
                 .finish(),
+            AuthProvider::Oke { .. } => f
+                .debug_struct("Oke")
+                .field("provider", &"[redacted]")
+                .finish(),
             AuthProvider::External { .. } => f
                 .debug_struct("External")
                 .field("provider", &"[redacted]")
@@ -157,6 +168,7 @@ pub(crate) enum AuthType {
     File,
     Instance,
     Resource,
+    Oke,
     External,
     Onprem,
     Cloudsim,
@@ -192,7 +204,9 @@ impl HandleBuilder {
     /// Note: Internally, if the [`HandleBuilder`] contains
     /// a reference to an existing [`reqwest::Client`], it will clone and
     /// use that. Otherwise, it will create a new [`reqwest::Client`] for its
-    /// own internal use. See [`reqwest_client()`](HandleBuilder::reqwest_client()).
+    /// own internal use. OKE token exchanges always use a dedicated client with
+    /// Kubernetes CA trust and TLS hostname verification.
+    /// See [`reqwest_client()`](HandleBuilder::reqwest_client()).
     pub async fn build(self) -> Result<Handle, NoSQLError> {
         Handle::new(&self).await
     }
@@ -216,8 +230,8 @@ impl HandleBuilder {
     /// | -------- | ----------- |
     /// | `ORACLE_NOSQL_ENDPOINT` | The URL endpoint to use. See [`HandleBuilder::endpoint()`]. |
     /// | `ORACLE_NOSQL_REGION` | The OCI region identifier. See [`HandleBuilder::cloud_region()`]. |
-    /// | `ORACLE_NOSQL_AUTH` | The auth mechanism. One of: `user`, `instance`, `resource`, `onprem`, `cloudsim`. |
-    /// | `ORACLE_NOSQL_AUTH_FILE` | For `user` auth, the path to the OCI config file (see [`HandleBuilder::cloud_auth_from_file()`]). For `onprem` auth, the path to the onprem user/password file (see [`HandleBuilder::onprem_auth_from_file()`]).
+    /// | `ORACLE_NOSQL_AUTH` | The auth mechanism. One of: `user`, `instance`, `resource`, `oke`, `onprem`, `cloudsim`. |
+    /// | `ORACLE_NOSQL_AUTH_FILE` | For `user` auth, the OCI config file. For `onprem`, the user/password file. For `oke`, an optional Kubernetes service account token file (see [`HandleBuilder::cloud_auth_from_oke_with_token_file()`]). |
     /// | `ORACLE_NOSQL_COMPARTMENT_ID` | For OCI auth, the default compartment id to use (see [`HandleBuilder::compartment_id()`]).
     /// | `ORACLE_NOSQL_CA_CERT` | For `onprem` auth, the path to the certificate file in `pem` format (see [`HandleBuilder::add_cert_from_pemfile()`]). |
     /// | `ORACLE_NOSQL_ACCEPT_INVALID_CERTS` | For `onprem` auth, if this is set to `1` or `true`, do not check certificates (see [`HandleBuilder::danger_accept_invalid_certs()`]). |
@@ -269,6 +283,12 @@ impl HandleBuilder {
                 }
                 "resource" => self = self.cloud_auth_from_resource()?,
                 "instance" => self = self.cloud_auth_from_instance()?,
+                "oke" => {
+                    self = match &filename {
+                        Some(path) => self.cloud_auth_from_oke_with_token_file(path)?,
+                        None => self.cloud_auth_from_oke()?,
+                    };
+                }
                 "user" => {
                     if let Some(fname) = &filename {
                         self = self.cloud_auth_from_file(fname)?;
@@ -512,7 +532,53 @@ impl HandleBuilder {
         self.mode = HandleMode::Cloud;
         Ok(self)
     }
-    // TODO: cloud_auth_from_oke
+    /// Authenticate using OKE workload identity and the default Kubernetes
+    /// service account token file, `/var/run/secrets/kubernetes.io/serviceaccount/token`.
+    ///
+    /// Requires `KUBERNETES_SERVICE_HOST`. The token endpoint uses HTTPS on port
+    /// 12250, trusting `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`, or
+    /// the file specified by `OCI_KUBERNETES_SERVICE_ACCOUNT_CERT_PATH`.
+    /// Certificate and hostname verification are always enabled for this exchange,
+    /// independently of the NoSQL client's TLS settings.
+    ///
+    /// Unless [`cloud_region()`](Self::cloud_region()) is set, the region is read
+    /// from `OCI_REGION_METADATA`, falling back to instance metadata when absent.
+    /// Set a default or per-request compartment. Session tokens refresh automatically;
+    /// the service account token file is re-read on each exchange.
+    pub fn cloud_auth_from_oke(mut self) -> Result<Self, NoSQLError> {
+        self.oke_token_source = OkeTokenSource::default();
+        self.auth_type = AuthType::Oke;
+        self.use_https = true;
+        self.mode = HandleMode::Cloud;
+        Ok(self)
+    }
+
+    /// Authenticate using OKE workload identity with an inline Kubernetes service
+    /// account token. An expired inline token requires rebuilding the handle with
+    /// a fresh token. For automatic service account token rotation, use a token file.
+    /// See [`cloud_auth_from_oke()`](Self::cloud_auth_from_oke()).
+    pub fn cloud_auth_from_oke_with_token(self, token: &str) -> Result<Self, NoSQLError> {
+        if token.trim().is_empty() {
+            return ia_err!("Kubernetes service account token must not be empty");
+        }
+        let mut builder = self.cloud_auth_from_oke()?;
+        builder.oke_token_source = OkeTokenSource::Token(token.to_string());
+        Ok(builder)
+    }
+
+    /// Authenticate using OKE workload identity with a custom Kubernetes service
+    /// account token file. The file is re-read on every session token refresh.
+    /// See [`cloud_auth_from_oke()`](Self::cloud_auth_from_oke()).
+    pub fn cloud_auth_from_oke_with_token_file(self, path: &str) -> Result<Self, NoSQLError> {
+        if path.trim().is_empty() {
+            return ia_err!("Kubernetes service account token file path must not be empty");
+        }
+        let mut builder = self.cloud_auth_from_oke()?;
+        builder.oke_token_source =
+            OkeTokenSource::File(crate::auth_common::file_utils::expand_user_home(path).into());
+        Ok(builder)
+    }
+
     /// Specify using OCI Resource Principal for authentication.
     ///
     /// Resource Principal is an IAM service feature that enables the resources to be authorized actors
@@ -562,7 +628,7 @@ impl HandleBuilder {
     /// This value may be overridden on a per-request basis.
     ///
     /// If no compartment is given, user-based OCI authentication uses the root compartment of the tenancy.
-    /// Instance-principal and resource-principal authentication require either this default compartment
+    /// Instance-principal, resource-principal, and OKE authentication require either this default compartment
     /// or a per-request compartment id.
     pub fn compartment_id(mut self, compartment_id: &str) -> Result<Self, NoSQLError> {
         self.default_compartment_id = compartment_id.to_string();
@@ -690,11 +756,13 @@ impl HandleBuilder {
         self.accept_invalid_certs = accept_invalid_certs;
         Ok(self)
     }
-    /// Specify a [`reqwest::Client`] to use for all http/s connections.
+    /// Specify a [`reqwest::Client`] to use for NoSQL http/s connections.
     ///
     /// By default, the [`NoSQL Handle`](crate::Handle) creates an internal [`reqwest::Client`] to use for
     /// all communications. If your application already has a reqwest Client, you can pass that
     /// into the HandleBuilder to avoid creating multiple connection pools.
+    /// OKE token exchanges use a separate client that trusts the Kubernetes CA
+    /// and always verifies the server certificate and hostname.
     pub fn reqwest_client(mut self, client: &Client) -> Result<Self, NoSQLError> {
         // TODO: validate client is open/operational?
         self.client = Some(client.clone());
@@ -804,6 +872,10 @@ impl HandleBuilder {
                 };
                 return Ok(true);
             }
+            AuthProvider::Oke { provider } => {
+                provider.refresh().await?;
+                return Ok(true);
+            }
             AuthProvider::Onprem { provider } => {
                 if let Some(prov) = provider {
                     let _ = prov.generate_token(client, true).await?;
@@ -818,6 +890,10 @@ impl HandleBuilder {
     pub(crate) async fn refresh_auth_if_needed(&self) -> Result<bool, NoSQLError> {
         let mut pguard = self.auth.lock().await;
         match &mut pguard.provider {
+            AuthProvider::Oke { provider } if provider.should_refresh() => {
+                provider.refresh().await?;
+                Ok(true)
+            }
             AuthProvider::Resource { provider } if provider.should_refresh() => {
                 let rfp = ResourcePrincipalAuthProvider::new()?;
                 pguard.provider = AuthProvider::Resource {

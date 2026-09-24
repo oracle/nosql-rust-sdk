@@ -64,6 +64,10 @@ pub fn string_to_region(id: &str) -> Result<Region, NoSQLError> {
 }
 
 impl Region {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn nosql_endpoint(&self) -> String {
         return format!("nosql.{}.oci.{}", self.id, self.realm_domain).to_string();
     }

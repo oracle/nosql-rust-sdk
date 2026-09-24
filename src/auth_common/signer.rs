@@ -46,7 +46,7 @@ pub fn get_required_headers(
     payload: &str,
     original_headers: HeaderMap,
     url_data: Url,
-    authentication_provider: &Box<dyn AuthenticationProvider>,
+    authentication_provider: &dyn AuthenticationProvider,
     query_params: HashMap<String, String>,
     exclude_body: bool,
 ) -> Result<HeaderMap, Box<dyn Error>> {
