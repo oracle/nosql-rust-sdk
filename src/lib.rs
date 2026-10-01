@@ -150,6 +150,7 @@
 //! The SDK requires an Oracle Cloud account and a subscription to the Oracle NoSQL Database Cloud Service. If you do not already have an Oracle Cloud account you can start [here](https://cloud.oracle.com/home).
 //!
 //! There are several ways of specifying the cloud service credentials to use, including:
+//!
 //! - Instance Principals
 //! - Resource Principals
 //! - OKE Workload Identity
@@ -171,40 +172,34 @@
 //!
 //! #### Using OKE Workload Identity
 //!
-//! Applications running in Oracle Container Engine for Kubernetes (OKE) can use
-//! their Kubernetes service account to authenticate to the NoSQL Cloud Service.
-//! Configure the workload's OCI access policies, then create a handle:
+//! Applications running in an enhanced Oracle Container Engine for Kubernetes (OKE) cluster can authenticate using their Kubernetes service account. Configure the pod to use that service account, mount its token and CA certificate, and grant the workload access to the required NoSQL resources through OCI IAM policies. See [Granting Workloads Access to OCI Resources](https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contenggrantingworkloadaccesstoresources.htm) for the cluster, service account, and policy setup.
+//!
+//! Use [`HandleBuilder::cloud_auth_from_oke()`] to create a handle with the default service account token file:
 //!
 //! ```no_run
-//! # use oracle_nosql_rust_sdk::Handle;
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let handle = Handle::builder()
-//!     .cloud_auth_from_oke()?
-//!     .compartment_id("ocid1.compartment.oc1..example")?
-//!     .build().await?;
-//! # Ok(())
-//! # }
+//! use oracle_nosql_rust_sdk::{Handle, NoSQLError};
+//!
+//! async fn get_handle() -> Result<Handle, NoSQLError> {
+//!     Handle::builder()
+//!         .cloud_auth_from_oke()?
+//!         .compartment_id("ocid1.compartment.oc1..example")?
+//!         .build()
+//!         .await
+//! }
 //! ```
 //!
-//! The default service account token is read from
-//! `/var/run/secrets/kubernetes.io/serviceaccount/token`. Use
-//! [`HandleBuilder::cloud_auth_from_oke_with_token_file()`] for a custom token file,
-//! or [`HandleBuilder::cloud_auth_from_oke_with_token()`] for an inline token.
-//! Session tokens refresh automatically; file-based service account tokens are
-//! re-read on refresh to pick up Kubernetes token rotation. An expired inline
-//! token requires rebuilding the handle with a fresh token.
+//! The default token file is `/var/run/secrets/kubernetes.io/serviceaccount/token`. To use a different source, replace `.cloud_auth_from_oke()?` with one of:
 //!
-//! `KUBERNETES_SERVICE_HOST` identifies the token exchange endpoint, which uses
-//! HTTPS on port 12250. Its certificate must match that host and chain to the CA
-//! in `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`, or the file selected
-//! by `OCI_KUBERNETES_SERVICE_ACCOUNT_CERT_PATH`. This exchange uses a dedicated
-//! client with certificate and hostname verification always enabled.
+//! - `.cloud_auth_from_oke_with_token_file("/path/to/service-account-token")?`
+//! - `.cloud_auth_from_oke_with_token(service_account_token)?`, where `service_account_token` is a `&str` containing the token.
 //!
-//! The region comes from [`HandleBuilder::cloud_region()`], `OCI_REGION_METADATA`,
-//! or instance metadata, in that order. A default or per-request compartment is
-//! required. For environment-based configuration, set `ORACLE_NOSQL_AUTH=oke`
-//! and optionally `ORACLE_NOSQL_AUTH_FILE` to a custom service account token file,
-//! then use [`HandleBuilder::from_environment()`].
+//! Session tokens refresh automatically. Token files are re-read on each refresh to pick up Kubernetes token rotation. An expired inline service account token requires rebuilding the handle with a fresh token.
+//!
+//! The pod must have `KUBERNETES_SERVICE_HOST` set and be able to reach that host over HTTPS on port 12250. The SDK trusts `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` for this exchange; set `OCI_KUBERNETES_SERVICE_ACCOUNT_CERT_PATH` to use a different CA certificate file. Certificate and hostname verification are always enabled for OKE token exchanges, independently of the NoSQL client's TLS settings.
+//!
+//! Set the region explicitly with `.cloud_region("us-ashburn-1")?`, or let the SDK discover it from `OCI_REGION_METADATA`, falling back to instance metadata when that variable is absent. A default compartment, as shown above, or a per-request compartment is required.
+//!
+//! For environment-based configuration, set `ORACLE_NOSQL_AUTH=oke` and `ORACLE_NOSQL_COMPARTMENT_ID`, then call `.from_environment()?`. Optionally set `ORACLE_NOSQL_AUTH_FILE` to a custom service account token file and `ORACLE_NOSQL_REGION` to an explicit region. The [quickstart instructions](#running-the-quickstart-with-oke-workload-identity) below also show how to override the example's local Cloud Simulator endpoint.
 //!
 //! #### Using User Config File to Specify OCI Credentials
 //!
@@ -380,6 +375,15 @@
 //!         // For cloud, using Resource Principal:
 //!         // .cloud_auth_from_resource()?
 //!         //
+//!         // For cloud, using OKE Workload Identity from an OKE pod:
+//!         // Override the local cloudsim endpoint above; use your target region.
+//!         // .endpoint("https://nosql.us-ashburn-1.oci.oraclecloud.com")?
+//!         // .cloud_region("us-ashburn-1")?
+//!         // .cloud_auth_from_oke()?
+//!         // .compartment_id("ocid1.compartment.oc1..example")?
+//!         // For a custom token file, replace cloud_auth_from_oke() with:
+//!         // .cloud_auth_from_oke_with_token_file("/path/to/service-account-token")?
+//!         //
 //!         // To read all of the above from environment variables:
 //!         .from_environment()?
 //!         //
@@ -527,6 +531,25 @@
 //!
 //! cargo run
 //! ```
+//!
+//! ### Running the Quickstart with OKE Workload Identity
+//!
+//! Run the quickstart inside a pod configured as described in [Using OKE Workload Identity](#using-oke-workload-identity). Its workload policy must allow the table and row operations performed by this example, including creating and dropping the example table.
+//!
+//! Set the following environment variables in the pod, replacing the compartment OCID and region with your values. Set the NoSQL endpoint explicitly because this example starts with a local Cloud Simulator endpoint, which setting the region alone does not replace.
+//!
+//! ```sh
+//! export ORACLE_NOSQL_AUTH=oke
+//! export ORACLE_NOSQL_COMPARTMENT_ID="ocid1.compartment.oc1..example"
+//! export ORACLE_NOSQL_REGION="us-ashburn-1"
+//! export ORACLE_NOSQL_ENDPOINT="https://nosql.us-ashburn-1.oci.oraclecloud.com"
+//! # Optional: use a custom service account token file.
+//! # export ORACLE_NOSQL_AUTH_FILE="/path/to/service-account-token"
+//!
+//! cargo run --example quickstart
+//! ```
+//!
+//! The command above runs the repository's [quickstart example](https://github.com/oracle/nosql-rust-sdk/blob/main/examples/quickstart/main.rs). If you copied the program into a standalone project as described above, use `cargo run` instead. Kubernetes supplies `KUBERNETES_SERVICE_HOST`; the service account token and CA certificate must be available inside the pod.
 //!
 //! ## Examples
 //!
