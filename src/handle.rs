@@ -6,6 +6,7 @@
 //
 use crate::auth_common::authentication_provider::AuthenticationProvider;
 use crate::auth_common::instance_principal_auth_provider::InstancePrincipalAuthProvider;
+use crate::auth_common::oke_workload_identity_auth_provider::OkeWorkloadIdentityAuthProvider;
 use crate::auth_common::resource_principal_auth_provider::ResourcePrincipalAuthProvider;
 use crate::auth_common::signer;
 use crate::handle_builder::AuthConfig;
@@ -313,9 +314,24 @@ impl Handle {
                 cb.build()?
             }
         };
-        // Instance/resource principal providers need network/environment data
+        // Instance/resource/OKE providers need network/environment data
         // before the handle can send signed cloud requests.
         match builder.auth_type {
+            AuthType::Oke => {
+                let provider = OkeWorkloadIdentityAuthProvider::new(
+                    builder.oke_token_source.clone(),
+                    builder.region.as_ref().map(|r| r.id()),
+                )
+                .await?;
+                if builder.region.is_none() {
+                    builder = builder.cloud_region(provider.region_id())?;
+                }
+                builder.auth = Arc::new(tokio::sync::Mutex::new(AuthConfig {
+                    provider: AuthProvider::Oke {
+                        provider: Box::new(provider),
+                    },
+                }));
+            }
             AuthType::Instance => {
                 let ifp = InstancePrincipalAuthProvider::new_with_client(&c).await?;
                 if builder.region.is_none() {
@@ -425,7 +441,7 @@ impl Handle {
         // If there is an OCI auth provider, use it below to sign the request.
         // On-prem auth can add headers immediately, while cloud auth needs the
         // completed request header set before signing.
-        let mut oci_provider: Option<&Box<dyn AuthenticationProvider>> = None;
+        let mut oci_provider: Option<&dyn AuthenticationProvider> = None;
         let mut requires_explicit_compartment = false;
 
         // The auth config can be refreshed after an auth failure, so take the
@@ -433,18 +449,22 @@ impl Handle {
         let pguard = self.inner.builder.auth.lock().await;
         match &pguard.provider {
             AuthProvider::Instance { provider } => {
-                oci_provider = Some(provider);
+                oci_provider = Some(provider.as_ref());
                 requires_explicit_compartment = true;
             }
             AuthProvider::Resource { provider } => {
-                oci_provider = Some(provider);
+                oci_provider = Some(provider.as_ref());
+                requires_explicit_compartment = true;
+            }
+            AuthProvider::Oke { provider } => {
+                oci_provider = Some(provider.as_ref());
                 requires_explicit_compartment = true;
             }
             AuthProvider::External { provider } => {
-                oci_provider = Some(provider);
+                oci_provider = Some(provider.as_ref());
             }
             AuthProvider::File { provider } => {
-                oci_provider = Some(provider);
+                oci_provider = Some(provider.as_ref());
             }
             AuthProvider::Onprem { provider } => {
                 if let Some(p) = provider {
@@ -765,7 +785,7 @@ impl Handle {
         }
         if requires_explicit_compartment {
             return ia_err!(
-                "instance principal and resource principal authentication require an explicit compartment id"
+                "instance principal, resource principal, and OKE authentication require an explicit compartment id"
             );
         }
         Ok(tenancy_id.to_string())

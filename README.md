@@ -37,108 +37,61 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-
 ### Statistics
 
-The SDK can collect client-side request statistics using Java-compatible profile
-names, profile behavior, and JSON field names. The periodic stats payload is
-intended to match the Oracle NoSQL Java SDK contract rather than define a
-Rust-specific format.
+The SDK can collect client-side request statistics using Java-compatible
+profile names and JSON field names:
 
-Profiles:
+- [`StatsProfile::None`] disables collection and does not emit stats. This
+  is the default.
+- [`StatsProfile::Regular`] emits aggregate request counts, success/error
+  counts, retry counts, request and response sizes, and basic latency
+  summaries.
+- [`StatsProfile::More`] adds latency percentile fields to the regular
+  request statistics.
+- [`StatsProfile::All`] adds query-level aggregation for SQL query requests.
 
-- `StatsProfile::None` disables collection and does not emit stats. This is the
-  default.
-- `StatsProfile::Regular` emits aggregate request counts, success/error counts,
-  retry counts, request and response sizes, and basic latency summaries.
-- `StatsProfile::More` adds `95th` and `99th` latency percentile fields to the
-  aggregate request statistics.
-- `StatsProfile::All` adds query-level aggregation for SQL query executions.
-
-Configure statistics on the `HandleBuilder` before building the handle. A
-non-`None` profile starts collection when the handle is built. Percentiles use
-exact Java-style samples by default; `StatsPercentileMode::Hdr` switches to a
-bounded histogram mode for lower memory growth under high request volume:
+Configure statistics on the [`HandleBuilder`] before building the handle.
+[`StatsPercentileMode::Exact`] is the default and matches the Java SDK's
+sample-and-sort percentile behavior; [`StatsPercentileMode::Hdr`] uses a
+bounded histogram mode for high-volume clients:
 
 ```rust
 use oracle_nosql_rust_sdk::{Handle, StatsPercentileMode, StatsProfile, StatsSnapshot};
-use std::error::Error;
 use std::time::Duration;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let handle = Handle::builder()
-        .from_environment()?
-        .stats_profile(StatsProfile::All)?
-        .stats_interval(Duration::from_secs(600))?
-        .stats_pretty_print(true)?
-        .stats_percentile_mode(StatsPercentileMode::Exact)?
-        .stats_handler(|stats: &StatsSnapshot| {
-            println!("{}", stats.as_json());
-        })?
-        .build()
-        .await?;
+let handle = Handle::builder()
+    .from_environment()?
+    .stats_profile(StatsProfile::All)?
+    .stats_interval(Duration::from_secs(600))?
+    .stats_pretty_print(true)?
+    .stats_percentile_mode(StatsPercentileMode::Exact)?
+    .stats_handler(|stats: &StatsSnapshot| {
+        println!("{}", stats.as_json());
+    })?
+    .build()
+    .await?;
 
-    let stats = handle.get_stats_control();
-    assert!(stats.is_started());
-    stats.stop();
-    stats.set_profile(StatsProfile::Regular);
-    stats.start();
-    Ok(())
-}
+let stats = handle.get_stats_control();
+assert!(stats.is_started());
+stats.stop();
+stats.set_profile(StatsProfile::Regular);
+stats.start();
 ```
 
-Stats latency is measured at the SDK HTTP boundary: the timer starts
-immediately before the HTTP request is sent and stops after the response body
-bytes are received. It includes network/proxy/server wait time and response body
-read time. It does not include full NSON result deserialization, final result
-object creation, or user code after `execute()` returns.
-
-`StatsProfile::All` can include raw SQL text and query plan text in emitted
-stats. For workloads where SQL literals, table names, or plans may be sensitive,
-prefer `stats_enable_log(false)?` and a `stats_handler` that redacts before
-storing or forwarding snapshots.
-
-The same settings can be supplied through environment variables:
-
-- `NOSQL_STATS_PROFILE` or `ORACLE_NOSQL_STATS_PROFILE`
-- `NOSQL_STATS_INTERVAL` or `ORACLE_NOSQL_STATS_INTERVAL`
-- `NOSQL_STATS_PRETTY_PRINT` or `ORACLE_NOSQL_STATS_PRETTY_PRINT`
-- `NOSQL_STATS_ENABLE_LOG` or `ORACLE_NOSQL_STATS_ENABLE_LOG`
-- `NOSQL_STATS_PERCENTILE_MODE` or `ORACLE_NOSQL_STATS_PERCENTILE_MODE`
-  (`EXACT` or `HDR`)
+**Sensitive data warning:** [`StatsProfile::All`] can include raw SQL text
+and query plan text in emitted stats. For workloads where SQL literals,
+table names, or plans may be sensitive, prefer `stats_enable_log(false)?`
+and a [`StatsSnapshot`] handler that redacts before forwarding stats.
 
 When stats logging is enabled, interval snapshots are emitted at `INFO` with
-the `Client stats|` prefix. The periodic payload follows the Java SDK schema:
-`clientId`, `startTime`, `endTime`, `requests`, optional `queries`, and optional
-`connections`. Initialization metadata such as SDK name and profile is logged
-separately. Like the Java SDK, `stop()` stops collection but a non-`None` profile
-can still emit empty interval snapshots.
+the `Client stats|` prefix. [`StatsControl::stop`] stops collection, but
+non-[`StatsProfile::None`] profiles can still emit empty interval snapshots
+like the Java SDK.
 
-For terminal examples and validation workloads, run:
-
-```sh
-cargo run --example stats
-STATS_PERCENTILE_MODE=HDR cargo run --example stats
-cargo run --example stats_profile_output_demo -- localhost 8080 MORE HDR
-cargo run --example stats_periodic_workload -- localhost 8080 300 5 MORE 1 HDR
-```
-
-With CloudSim running on `localhost:8080`, the ignored opt-in end-to-end stats
-test runs a mixed real SDK workload, independently computes throughput plus
-average, p95, and p99 latency, then checks those values against the SDK stats
-snapshot with configured tolerances:
-
-```sh
-RUN_NOSQL_STATS_E2E=1 \
-NOSQL_STATS_E2E_MODE=cloudsim \
-NOSQL_STATS_E2E_ENDPOINT=http://localhost:8080 \
-cargo test --test stats_e2e_tests -- --ignored --nocapture
-```
-
-For maintainer notes and validation commands, see
-[`docs/stats.md`](docs/stats.md).
-
+Stats latency is measured from immediately before the HTTP request is sent
+until the response body bytes are received. It does not include full NSON
+result deserialization or final result object creation.
 
 ### Prerequisites
 - Rust 1.88 or later
@@ -185,8 +138,10 @@ Before using the Cloud Service, it is recommended that users start with the Clou
 The SDK requires an Oracle Cloud account and a subscription to the Oracle NoSQL Database Cloud Service. If you do not already have an Oracle Cloud account you can start [here](https://cloud.oracle.com/home).
 
 There are several ways of specifying the cloud service credentials to use, including:
+
 - Instance Principals
 - Resource Principals
+- OKE Workload Identity
 - User Config File
 
 ##### Using Instance Principal Credentials
@@ -202,6 +157,37 @@ To configure NoSQL in this mode, use the [`HandleBuilder::cloud_auth_from_instan
 Resource Principal is an IAM service feature that enables the resources to be authorized actors (or principals) to perform actions on service resources. You may use Resource Principal when calling Oracle NoSQL Database Cloud Service from other Oracle Cloud service resource such as [Functions](https://docs.cloud.oracle.com/en-us/iaas/Content/Functions/Concepts/functionsoverview.htm). See [Accessing Other Oracle Cloud Infrastructure Resources from Running Functions](https://docs.cloud.oracle.com/en-us/iaas/Content/Functions/Tasks/functionsaccessingociresources.htm) for how to set up Resource Principal.
 
 To configure NoSQL in this mode, use the [`HandleBuilder::cloud_auth_from_resource()`] method on the config struct.
+
+##### Using OKE Workload Identity
+
+Applications running in an enhanced Oracle Container Engine for Kubernetes (OKE) cluster can authenticate using their Kubernetes service account. Configure the pod to use that service account, mount its token and CA certificate, and grant the workload access to the required NoSQL resources through OCI IAM policies. See [Granting Workloads Access to OCI Resources](https://docs.oracle.com/en-us/iaas/Content/ContEng/Tasks/contenggrantingworkloadaccesstoresources.htm) for the cluster, service account, and policy setup.
+
+Use [`HandleBuilder::cloud_auth_from_oke()`] to create a handle with the default service account token file:
+
+```rust
+use oracle_nosql_rust_sdk::{Handle, NoSQLError};
+
+async fn get_handle() -> Result<Handle, NoSQLError> {
+    Handle::builder()
+        .cloud_auth_from_oke()?
+        .compartment_id("ocid1.compartment.oc1..example")?
+        .build()
+        .await
+}
+```
+
+The default token file is `/var/run/secrets/kubernetes.io/serviceaccount/token`. To use a different source, replace `.cloud_auth_from_oke()?` with one of:
+
+- `.cloud_auth_from_oke_with_token_file("/path/to/service-account-token")?`
+- `.cloud_auth_from_oke_with_token(service_account_token)?`, where `service_account_token` is a `&str` containing the token.
+
+Session tokens refresh automatically. Token files are re-read on each refresh to pick up Kubernetes token rotation. An expired inline service account token requires rebuilding the handle with a fresh token.
+
+The pod must have `KUBERNETES_SERVICE_HOST` set and be able to reach that host over HTTPS on port 12250. The SDK trusts `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` for this exchange; set `OCI_KUBERNETES_SERVICE_ACCOUNT_CERT_PATH` to use a different CA certificate file. Certificate and hostname verification are always enabled for OKE token exchanges, independently of the NoSQL client's TLS settings.
+
+Set the region explicitly with `.cloud_region("us-ashburn-1")?`, or let the SDK discover it from `OCI_REGION_METADATA`, falling back to instance metadata when that variable is absent. A default compartment, as shown above, or a per-request compartment is required.
+
+For environment-based configuration, set `ORACLE_NOSQL_AUTH=oke` and `ORACLE_NOSQL_COMPARTMENT_ID`, then call `.from_environment()?`. Optionally set `ORACLE_NOSQL_AUTH_FILE` to a custom service account token file and `ORACLE_NOSQL_REGION` to an explicit region. The [quickstart instructions](#running-the-quickstart-with-oke-workload-identity) below also show how to override the example's local Cloud Simulator endpoint.
 
 ##### Using User Config File to Specify OCI Credentials
 
@@ -361,6 +347,15 @@ async fn get_handle() -> Result<Handle, NoSQLError> {
         // For cloud, using Resource Principal:
         // .cloud_auth_from_resource()?
         //
+        // For cloud, using OKE Workload Identity from an OKE pod:
+        // Override the local cloudsim endpoint above; use your target region.
+        // .endpoint("https://nosql.us-ashburn-1.oci.oraclecloud.com")?
+        // .cloud_region("us-ashburn-1")?
+        // .cloud_auth_from_oke()?
+        // .compartment_id("ocid1.compartment.oc1..example")?
+        // For a custom token file, replace cloud_auth_from_oke() with:
+        // .cloud_auth_from_oke_with_token_file("/path/to/service-account-token")?
+        //
         // To read all of the above from environment variables:
         .from_environment()?
         //
@@ -508,6 +503,25 @@ cargo build
 
 cargo run
 ```
+
+#### Running the Quickstart with OKE Workload Identity
+
+Run the quickstart inside a pod configured as described in [Using OKE Workload Identity](#using-oke-workload-identity). Its workload policy must allow the table and row operations performed by this example, including creating and dropping the example table.
+
+Set the following environment variables in the pod, replacing the compartment OCID and region with your values. Set the NoSQL endpoint explicitly because this example starts with a local Cloud Simulator endpoint, which setting the region alone does not replace.
+
+```sh
+export ORACLE_NOSQL_AUTH=oke
+export ORACLE_NOSQL_COMPARTMENT_ID="ocid1.compartment.oc1..example"
+export ORACLE_NOSQL_REGION="us-ashburn-1"
+export ORACLE_NOSQL_ENDPOINT="https://nosql.us-ashburn-1.oci.oraclecloud.com"
+# Optional: use a custom service account token file.
+# export ORACLE_NOSQL_AUTH_FILE="/path/to/service-account-token"
+
+cargo run --example quickstart
+```
+
+The command above runs the repository's [quickstart example](https://github.com/oracle/nosql-rust-sdk/blob/main/examples/quickstart/main.rs). If you copied the program into a standalone project as described above, use `cargo run` instead. Kubernetes supplies `KUBERNETES_SERVICE_HOST`; the service account token and CA certificate must be available inside the pod.
 
 ### Examples
 

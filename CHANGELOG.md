@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/).
 
 ### Added
 - Latest OCI region codes
+- Added OKE workload identity authentication with Kubernetes service account
+  tokens, automatic session token refresh, and verified TLS for token exchanges
 
 ### Fixed
 - Server-controlled query plan triggers panic! abort

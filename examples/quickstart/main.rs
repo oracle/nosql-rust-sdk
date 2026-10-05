@@ -14,6 +14,22 @@
 // To run this example:
 //    cargo run --example quickstart
 //
+// To run inside an OKE pod with workload identity, configure its service account
+// and OCI IAM policies as described in README.md, then set these pod variables:
+//    ORACLE_NOSQL_AUTH=oke
+//    ORACLE_NOSQL_COMPARTMENT_ID=ocid1.compartment.oc1..example
+//    ORACLE_NOSQL_REGION=us-ashburn-1
+//    ORACLE_NOSQL_ENDPOINT=https://nosql.us-ashburn-1.oci.oraclecloud.com
+// Replace the compartment and region with your values. The endpoint overrides
+// the local cloudsim default below. The workload needs permission to create and
+// drop the example table and read/write its rows.
+// Optionally set ORACLE_NOSQL_AUTH_FILE to a custom service account token file.
+// The default token and CA certificate are mounted under
+// /var/run/secrets/kubernetes.io/serviceaccount/. KUBERNETES_SERVICE_HOST must
+// be available in the pod. Session tokens refresh automatically; the service
+// account token file is re-read on refresh. OKE token exchanges always verify
+// the server certificate and hostname.
+//
 // for extra output:
 //    RUST_LOG=debug cargo run --example quickstart
 //
@@ -63,6 +79,15 @@ async fn get_handle() -> Result<Handle, NoSQLError> {
         //
         // For cloud, using Resource Principal:
         // .cloud_auth_from_resource()?
+        //
+        // For cloud, using OKE Workload Identity from an OKE pod:
+        // Override the local cloudsim endpoint above; use your target region.
+        // .endpoint("https://nosql.us-ashburn-1.oci.oraclecloud.com")?
+        // .cloud_region("us-ashburn-1")?
+        // .cloud_auth_from_oke()?
+        // .compartment_id("ocid1.compartment.oc1..example")?
+        // For a custom token file, replace cloud_auth_from_oke() with:
+        // .cloud_auth_from_oke_with_token_file("/path/to/service-account-token")?
         //
         // To read all of the above from environment variables:
         // or, to override above from environment;
